@@ -187,7 +187,8 @@ async def fetch_jobs(role_keywords: str, location: str) -> List[Dict[str, Any]]:
         async with httpx.AsyncClient(timeout=10) as http:
             res = await http.get(url, params=params)
             res.raise_for_status()
-            return res.json().get("results", []) or []
+            results = res.json().get("results", []) or []
+            return [normalize_job(j) for j in results]
     except Exception:
         return []
 
@@ -206,7 +207,11 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
 
     # Reset search if new intent
     if NEW_SEARCH_RE.search(low):
-        state.update({"jobs_shown": False, "phase": "discovery"})
+        state.update({
+            "jobs_shown": False,
+            "phase": "discovery",
+            "cached_jobs": []
+        })
 
     # Update signals
     extract_signals(user_message, state)
@@ -216,12 +221,11 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
         state["phase"] = "ready"
 
     # Already shown jobs, no new search
-    if state.get("jobs_shown") and not NEW_SEARCH_RE.search(low):
+    if state.get("phase") == "results" and not NEW_SEARCH_RE.search(low):
         return {
-            "assistantText": "Want to try a different role, location, or type of work?",
-            "mode": "chat",
-            "jobs": [],
-            "debug": {"phase": "results"}
+            "assistantText": "",
+            "mode": "results",
+            "jobs": state.get("cached_jobs", [])
         }
 
     # Discovery phase
@@ -234,11 +238,15 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
     # Ready to fetch jobs
     if state["phase"] == "ready":
         jobs = await fetch_jobs(state["role_keywords"], state["location"]) or []
-        state.update({"jobs_shown": True, "phase": "results"})
+        state.update({
+            "jobs_shown": True,
+            "phase": "results",
+            "cached_jobs": jobs
+        })
         return {
-           "assistantText": "Here are some options that match what you’re looking for.",
-           "mode": "results" if jobs else "no_results",
-           "jobs": jobs
+            "assistantText": "Here are some options that match what you’re looking for.",
+            "mode": "results" if jobs else "no_results",
+            "jobs": jobs
         }
 
     # Fallback: generate AI response
