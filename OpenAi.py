@@ -27,7 +27,6 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 # -------------------------------------------------------------------
 
 _STOP = r"(?:\s+(?:in|near|based in|based)\b|[.,;!?]|$)"
-
 BAD_ROLE_KEYWORDS = {"a job", "job", "jobs", "work", "position", "role", "career", "employment"}
 NEW_SEARCH_RE = re.compile(r"\b(find|search|look for|can you find|what about)\b", re.I)
 
@@ -77,24 +76,31 @@ def extract_signals(message: str, state: dict) -> None:
             if loc_match:
                 state["location"] = loc_match.group(1).strip().title()
 
-    # Role keywords
+    # Role keywords (extended regex to capture 'part time job as')
     if not state.get("role_keywords"):
         role_match = re.search(
-            r"\b(?:work as|job as|be a|be an|looking for|i am a|i am an)\s+(.+?)" + _STOP,
+            r"\b(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as)\s+(.+?)" + _STOP,
             low, re.I
         )
         if role_match:
             state["role_keywords"] = role_match.group(1).strip()
 
-    # Fallback role
+    # Fallback role if regex fails
     if not state.get("role_keywords") and state.get("location"):
         inferred = _strip_fillers(re.split(r"\b(?:in|near|based in|based)\b", low, 1)[0])
-        if len(inferred) >= 3:
+        if inferred:
             state["role_keywords"] = inferred
 
     # Remove junk roles
     if (state.get("role_keywords") or "").lower() in BAD_ROLE_KEYWORDS:
         state["role_keywords"] = None
+
+    # Force phase to ready if both role and location exist
+    if state.get("role_keywords") and state.get("location"):
+        state["phase"] = "ready"
+
+    # Debug
+    print(f"[DEBUG] extract_signals: role_keywords={state.get('role_keywords')}, location={state.get('location')}, phase={state.get('phase')}")
 
 
 def next_discovery_question(state: dict) -> Optional[str]:
