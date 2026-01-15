@@ -259,7 +259,7 @@ async def fetch_jobs(role_keywords: str, location: str, income_type: str = "job"
         "app_key": ADZUNA_APP_KEY,
         "what": query,
         "where": location.title(),
-        "results_per_page": 30,
+        "results_per_page": 38,
     }
 
     try:
