@@ -203,38 +203,66 @@ Search Trigger Rules
 
 
 # -------------------------------------------------------------------
-# Job fetching
+# Job fetching (enhanced)
 # -------------------------------------------------------------------
+async def fetch_jobs(role_keywords: str, location: str, income_type: str = "job") -> List[Dict[str, Any]]:
+    """
+    Fetch jobs from Adzuna API, filtering by role, location, and income_type.
+    income_type maps to categories like full-time, part-time, temporary, freelance, internship.
+    """
+    # Map income_type to Adzuna search keywords
+    income_map = {
+        "full-time": "fulltime",
+        "part-time": "parttime",
+        "temporary": "temporary",
+        "freelance": "freelance",
+        "internship": "internship",
+        "job": ""  # default: no filter
+    }
 
-async def fetch_jobs(role_keywords: str, location: str) -> List[Dict[str, Any]]:
+    adzuna_income = income_map.get(income_type.lower(), "")
+
+    # Construct search query
+    query = role_keywords
+    if adzuna_income:
+        query += f" {adzuna_income}"
+
     url = "https://api.adzuna.com/v1/api/jobs/gb/search/1"
     params = {
         "app_id": ADZUNA_APP_ID,
         "app_key": ADZUNA_APP_KEY,
-        "what": role_keywords,
+        "what": query,
         "where": location,
         "results_per_page": 30,
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10) as http:
+        async with httpx.AsyncClient(timeout=15) as http:
             res = await http.get(url, params=params)
             res.raise_for_status()
             results = res.json().get("results", []) or []
+            # Optional: normalize each job into your internal structure
             return [normalize_job(j) for j in results]
-    except Exception:
+    except Exception as e:
+        print(f"[DEBUG] fetch_jobs failed: {e}")
         return []
 
 
 # -------------------------------------------------------------------
 # Main chat entry
 # -------------------------------------------------------------------
-
 async def chat_with_user(*, user_id: str, user_message: str, conversation_history: list) -> dict:
+    """
+    Main chat logic:
+    - Extract signals (role, location, income type)
+    - Determine phase: discovery, ready, results
+    - Fetch jobs from Adzuna with income_type support
+    - Fallback to AI-generated reply if needed
+    """
     state = get_state(user_id)
-    low = (user_message or "").lower()
+    low = (user_message or "").lower().strip()
 
-    # Reset search if user triggers new intent
+    # --- Reset search if user triggers new intent
     if NEW_SEARCH_RE.search(low):
         state.update({
             "jobs_shown": False,
@@ -242,18 +270,14 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             "cached_jobs": []
         })
 
-    # Extract signals from user message
-    extract_signals(user_message, state)
+    # --- Extract signals from user message
+    await extract_signals(user_message, state)
 
-    # Force ready phase if role_keywords and location exist
-    if state.get("role_keywords") and state.get("location"):
-        state["phase"] = "ready"
-        state["readiness"] = True
+    # --- Debug
+    print(f"[DEBUG] user_message={user_message}, role_keywords={state.get('role_keywords')}, "
+          f"location={state.get('location')}, income_type={state.get('income_type')}, phase={state.get('phase')}")
 
-    # Debug
-    print(f"[DEBUG] user_message={user_message}, role_keywords={state.get('role_keywords')}, location={state.get('location')}, phase={state.get('phase')}")
-
-    # If we already presented jobs and no new search intent, return cached jobs
+    # --- Already presented jobs, no new search
     if state.get("phase") == "results" and not NEW_SEARCH_RE.search(low):
         return {
             "assistantText": "Here are your previously suggested jobs.",
@@ -261,23 +285,45 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             "jobs": state.get("cached_jobs", [])
         }
 
-    # Discovery phase: ask missing questions
+    # --- Discovery phase: ask missing questions
     if state.get("phase") == "discovery":
-        q = next_discovery_question(state)
-        if q:
-            return {"assistantText": q, "mode": "chat", "jobs": []}
-        state["phase"] = "ready"  # Move to ready if all signals captured
+        question = next_discovery_question(state)
+        if question:
+            return {"assistantText": question, "mode": "chat", "jobs": []}
+        state["phase"] = "ready"  # move to ready if all signals captured
 
+    # --- Ready phase: fetch jobs
     if state.get("phase") == "ready":
         role = state.get("role_keywords")
         location = state.get("location")
-        jobs = await fetch_jobs(role, location) or []
-        state.update({"jobs_shown":True,"phase":"results","cached_jobs":jobs})
-        assistant_text = f"Here are some options that match your search for a {role} in {location}." if jobs else f"Sorry, I couldn't find any jobs for a {role} in {location}."
-        return {"assistantText":assistant_text,"mode":"results" if jobs else "no_results","jobs":jobs}
+        income_type = state.get("income_type") or "job"
 
-    # Fallback: GPT response
+        jobs = await fetch_jobs(role, location, income_type)
+        state.update({
+            "jobs_shown": True,
+            "phase": "results",
+            "cached_jobs": jobs
+        })
+
+        assistant_text = (
+            f"Here are some options that match your search for a {income_type} '{role}' in {location}."
+            if jobs else
+            f"Sorry, I couldn't find any jobs for a {income_type} '{role}' in {location}."
+        )
+
+        return {
+            "assistantText": assistant_text,
+            "mode": "results" if jobs else "no_results",
+            "jobs": jobs
+        }
+
+    # --- Fallback: generate AI response
     reply = await generate_coached_reply(state, conversation_history, user_message)
     if not reply or reply.strip() == "":
         reply = "Hello! I can help you find jobs or gigs. What role are you interested in?"
-    return {"assistantText":reply.strip(),"mode":"chat","jobs":[]}
+
+    return {
+        "assistantText": reply.strip(),
+        "mode": "chat",
+        "jobs": []
+    }
