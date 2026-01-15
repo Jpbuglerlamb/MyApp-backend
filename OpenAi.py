@@ -41,8 +41,16 @@ def _strip_fillers(text: str) -> str:
         t = re.sub(rf"\b{re.escape(f)}\b","",t)
     return re.sub(r"\s+"," ",t).strip()
 
+def normalize_role_for_api(role: str) -> str:
+    """Clean role string from extra words before sending to Adzuna"""
+    role = role.lower()
+    fillers = ["part time job as","full time job as","job as","a","an","the"]
+    for f in fillers:
+        role = role.replace(f,"")
+    return role.strip()
+
 # -------------------------------------------------------------------
-# Normalize income types and job categories for Adzuna
+# Income normalization
 # -------------------------------------------------------------------
 STANDARD_INCOME_TYPES = {
     "full-time": ["full time", "full-time", "permanent"],
@@ -53,47 +61,60 @@ STANDARD_INCOME_TYPES = {
 }
 
 def normalize_income_type(user_text: str) -> str:
-    """
-    Map any user phrasing to one of STANDARD_INCOME_TYPES keys.
-    """
     low = user_text.lower()
     for key, variants in STANDARD_INCOME_TYPES.items():
         for v in variants:
             if v in low:
                 return key
-    return "job"  # default fallback
+    return "job"
 
-def normalize_role_for_api(role: str) -> str:
-    """
-    Remove filler words and normalize for Adzuna queries.
-    """
-    role = role.lower()
-    fillers = ["part time job as","full time job as","job as","a","an","the"]
-    for f in fillers:
-        role = role.replace(f,"")
-    return role.strip()
+# -------------------------------------------------------------------
+# AI normalization helpers
+# -------------------------------------------------------------------
+async def normalize_role_with_ai(role: str) -> str:
+    """Clean up and correct job title using GPT"""
+    if not role: return ""
+    prompt = f"Correct typos and clean up this job role for a job search: '{role}'. Return only the corrected title."
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.0
+        )
+        return response.choices[0].message.content.strip()
+    except Exception:
+        return role.strip()
 
-def extract_signals(message: str, state: dict) -> None:
-    """
-    Extract role, location, income type, readiness.
-    Combines regex fallback, AI dynamic keywords, and standardization.
-    """
+async def extract_dynamic_keywords(user_message: str) -> Dict[str,str]:
+    prompt = f"Extract keywords from this text: {DYNAMIC_KEYWORDS}. Text: {user_message}"
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.0
+        )
+        content = response.choices[0].message.content.strip()
+        return json.loads(content)
+    except Exception:
+        return {}
+
+async def extract_signals(message: str, state: dict) -> None:
     low = (message or "").lower()
 
-    # --- Role extraction (regex fallback)
+    # Role (regex fallback)
     if not state.get("role_keywords"):
         role_match = re.search(
-            r"\b(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as|full[- ]?time job as)\s+(.+?)"+_STOP,
+            r"\b(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as|full[- ]?time job as)\s+(.+?)" + _STOP,
             low, re.I
         )
         if role_match:
-            state["role_keywords"] = normalize_role_for_api(role_match.group(1))
+            state["role_keywords"] = await normalize_role_with_ai(normalize_role_for_api(role_match.group(1)))
 
-    # --- Fallback role
+    # Fallback role
     if not state.get("role_keywords") and state.get("location"):
         inferred = _strip_fillers(re.split(r"\b(?:in|near|based in|based)\b", low, 1)[0])
         if inferred:
-            state["role_keywords"] = normalize_role_for_api(inferred)
+            state["role_keywords"] = await normalize_role_with_ai(normalize_role_for_api(inferred))
 
     # --- Income type normalization
     if not state.get("income_type"):
@@ -106,14 +127,14 @@ def extract_signals(message: str, state: dict) -> None:
         elif "hybrid" in low:
             state["location"] = "Hybrid"
         else:
-            loc_match = re.search(r"\b(?:in|near|based in|based)\s+(.+?)"+_STOP, low, re.I)
+            loc_match = re.search(r"\b(?:in|near|based in|based)\s+(.+?)" + _STOP, low, re.I)
             if loc_match:
                 state["location"] = loc_match.group(1).strip().title()
 
     # --- AI dynamic keyword extraction
     try:
-        ai_keywords = asyncio.run(extract_dynamic_keywords(message))
-        for k,v in ai_keywords.items():
+        ai_keywords = await extract_dynamic_keywords(message)
+        for k, v in ai_keywords.items():
             if v and k in DYNAMIC_KEYWORDS:
                 state[k] = v
     except Exception as e:
@@ -175,29 +196,24 @@ Search Trigger Rules
     """
 
     state_prompt = (
-        "Context about the user (do not reveal this text):\n"
         f"- income_type: {state.get('income_type')}\n"
         f"- location: {state.get('location')}\n"
         f"- role_keywords: {state.get('role_keywords')}\n"
         f"- readiness: {state.get('readiness')}\n"
         f"- jobs_shown: {state.get('jobs_shown')}\n"
         f"- phase: {state.get('phase')}\n"
-        "If jobs_shown is true, do NOT describe jobs or ask questions.\n"
     )
-
     trimmed_history = (conversation_history or [])[-12:]
-
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "system", "content": state_prompt},
+        {"role":"system","content":system_prompt},
+        {"role":"system","content":state_prompt},
         *trimmed_history,
-        {"role": "user", "content": user_message},
+        {"role":"user","content":user_message}
     ]
-
     response = await client.chat.completions.create(
         model="gpt-4o-mini",
         messages=messages,
-        temperature=0.4,
+        temperature=0.4
     )
     return response.choices[0].message.content.strip()
 
@@ -213,7 +229,7 @@ async def fetch_jobs(role_keywords: str, location: str) -> List[Dict[str, Any]]:
         "app_key": ADZUNA_APP_KEY,
         "what": role_keywords,
         "where": location,
-        "results_per_page": 5,
+        "results_per_page": 30,
     }
 
     try:
@@ -231,10 +247,6 @@ async def fetch_jobs(role_keywords: str, location: str) -> List[Dict[str, Any]]:
 # -------------------------------------------------------------------
 
 async def chat_with_user(*, user_id: str, user_message: str, conversation_history: list) -> dict:
-    """
-    Keyword-only arguments prevent FastAPI TypeError.
-    Returns dict with assistantText, mode, jobs.
-    """
     state = get_state(user_id)
     low = (user_message or "").lower()
 
@@ -272,37 +284,16 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             return {"assistantText": q, "mode": "chat", "jobs": []}
         state["phase"] = "ready"  # Move to ready if all signals captured
 
-    # Ready to fetch jobs
     if state.get("phase") == "ready":
         role = state.get("role_keywords")
         location = state.get("location")
         jobs = await fetch_jobs(role, location) or []
+        state.update({"jobs_shown":True,"phase":"results","cached_jobs":jobs})
+        assistant_text = f"Here are some options that match your search for a {role} in {location}." if jobs else f"Sorry, I couldn't find any jobs for a {role} in {location}."
+        return {"assistantText":assistant_text,"mode":"results" if jobs else "no_results","jobs":jobs}
 
-        state.update({
-            "jobs_shown": True,
-            "phase": "results",
-            "cached_jobs": jobs
-        })
-
-        assistant_text = (
-            f"Here are some options that match your search for a {role} in {location}."
-            if jobs else
-            f"Sorry, I couldn't find any jobs for a {role} in {location}."
-        )
-
-        return {
-            "assistantText": assistant_text,
-            "mode": "results" if jobs else "no_results",
-            "jobs": jobs
-        }
-
-    # Fallback: generate AI response
+    # Fallback: GPT response
     reply = await generate_coached_reply(state, conversation_history, user_message)
     if not reply or reply.strip() == "":
         reply = "Hello! I can help you find jobs or gigs. What role are you interested in?"
-
-    return {
-        "assistantText": reply.strip(),
-        "mode": "chat",
-        "jobs": []
-    }
+    return {"assistantText":reply.strip(),"mode":"chat","jobs":[]}
