@@ -4,15 +4,15 @@ import os
 import httpx
 import re
 from typing import List, Dict, Any, Optional
+import asyncio
+import json
 
-from memory_store import get_state  # single source of truth
+from memory_store import get_state
 
 # -------------------------------------------------------------------
 # Setup
 # -------------------------------------------------------------------
-
 load_dotenv()
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID")
 ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY")
@@ -23,74 +23,65 @@ if not OPENAI_API_KEY or not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # -------------------------------------------------------------------
-# Constants / helpers
+# Constants
 # -------------------------------------------------------------------
-
 _STOP = r"(?:\s+(?:in|near|based in|based)\b|[.,;!?]|$)"
 BAD_ROLE_KEYWORDS = {"a job", "job", "jobs", "work", "position", "role", "career", "employment"}
 NEW_SEARCH_RE = re.compile(r"\b(find|search|look for|can you find|what about)\b", re.I)
-DYNAMIC_KEYWORDS = ["jobs", "gigs", "role", "industry", "location", "salary", "qualifications", "experience", "knowledge"]
+DYNAMIC_KEYWORDS = ["jobs","gigs","role","industry","location","salary","qualifications","experience","knowledge"]
 
 # -------------------------------------------------------------------
-# Signal extraction and AI-driven dynamic keywords
+# Helpers
 # -------------------------------------------------------------------
-
 def _strip_fillers(text: str) -> str:
-    t = text.lower().strip()
-    t = re.sub(r"[^\w\s+-]", " ", t)
-    fillers = ["i'm", "im", "i am", "looking", "looking for", "looking at",
-               "i want", "i need", "find me", "search", "show me",
-               "a", "an", "the", "job", "jobs", "role", "position", "work",
-               "please", "thanks"]
+    t = text.lower()
+    fillers = ["i'm","im","i am","looking","looking for","looking at","i want","i need","find me",
+               "search","show me","a","an","the","job","jobs","role","position","work","please","thanks"]
     for f in fillers:
-        t = re.sub(rf"\b{re.escape(f)}\b", " ", t)
-    return re.sub(r"\s+", " ", t).strip()
-
+        t = re.sub(rf"\b{re.escape(f)}\b","",t)
+    return re.sub(r"\s+"," ",t).strip()
 
 def normalize_role_for_api(role: str) -> str:
     role = role.lower()
-    fillers = ["part time job as", "full time job as", "job as", "a", "an", "the"]
+    fillers = ["part time job as","full time job as","job as","a","an","the"]
     for f in fillers:
-        role = role.replace(f, "")
+        role = role.replace(f,"")
     return role.strip()
 
-
-async def extract_dynamic_keywords(user_message: str) -> Dict[str, str]:
-    """Use AI to extract dynamic keywords from the user's message."""
-    prompt = f"Extract the following keywords from this text: {DYNAMIC_KEYWORDS}. Text: {user_message}"
-
-    response = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0
-    )
-
-    # Expect JSON dictionary from AI
+async def extract_dynamic_keywords(user_message: str) -> Dict[str,str]:
+    """AI-driven extraction of dynamic keywords from a human message"""
+    prompt = f"Extract these keywords {DYNAMIC_KEYWORDS} from the text: {user_message} in JSON format."
     try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.0
+        )
         content = response.choices[0].message.content.strip()
-        import json
         return json.loads(content)
     except Exception:
         return {}
 
-
+# -------------------------------------------------------------------
+# Signal extraction
+# -------------------------------------------------------------------
 def extract_signals(message: str, state: dict) -> None:
-    """Extract role, location, income type, and readiness from user message using regex and AI-driven dynamic keywords."""
+    """Extract role, location, income type, and readiness using regex and AI"""
     low = (message or "").lower().strip()
 
-    # Legacy regex extraction (fallback)
+    # Regex fallback for role
     if not state.get("role_keywords"):
-        role_match = re.search(r"\b(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as)\s+(.+?)" + _STOP, low, re.I)
+        role_match = re.search(r"\b(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as)\s+(.+?)"+_STOP, low, re.I)
         if role_match:
-            state["role_keywords"] = normalize_role_for_api(role_match.group(1).strip())
+            state["role_keywords"] = normalize_role_for_api(role_match.group(1))
 
-    # Fallback role if regex fails
+    # Fallback if regex fails
     if not state.get("role_keywords") and state.get("location"):
-        inferred = _strip_fillers(re.split(r"\b(?:in|near|based in|based)\b", low, 1)[0])
+        inferred = _strip_fillers(re.split(r"\b(?:in|near|based in|based)\b", low,1)[0])
         if inferred:
             state["role_keywords"] = normalize_role_for_api(inferred)
 
-    # Update income type from keywords
+    # Income type
     if not state.get("income_type"):
         if re.search(r"\b(gig|freelance|contract)\b", low):
             state["income_type"] = "gig"
@@ -99,44 +90,39 @@ def extract_signals(message: str, state: dict) -> None:
 
     # Location extraction
     if not state.get("location"):
-        if "remote" in low:
-            state["location"] = "Remote"
-        elif "hybrid" in low:
-            state["location"] = "Hybrid"
+        if "remote" in low: state["location"] = "Remote"
+        elif "hybrid" in low: state["location"] = "Hybrid"
         else:
-            loc_match = re.search(r"\b(?:in|near|based in|based)\s+(.+?)" + _STOP, low, re.I)
-            if loc_match:
-                state["location"] = loc_match.group(1).strip().title()
+            loc_match = re.search(r"\b(?:in|near|based in|based)\s+(.+?)"+_STOP, low, re.I)
+            if loc_match: state["location"] = loc_match.group(1).strip().title()
 
-    # AI-driven extraction
-    import asyncio
+    # AI-driven dynamic keywords
     try:
         ai_keywords = asyncio.run(extract_dynamic_keywords(message))
-        for k, v in ai_keywords.items():
+        for k,v in ai_keywords.items():
             if v and k in DYNAMIC_KEYWORDS:
                 state[k] = v
     except Exception as e:
         print(f"[DEBUG] AI keyword extraction failed: {e}")
 
-    # Remove junk roles
+    # Remove junk
     if (state.get("role_keywords") or "").lower() in BAD_ROLE_KEYWORDS:
         state["role_keywords"] = None
 
-    # Force ready phase if role and location exist
+    # Force ready
     if state.get("role_keywords") and state.get("location"):
         state["phase"] = "ready"
         state["readiness"] = True
 
     print(f"[DEBUG] extract_signals: {state}")
 
-
+# -------------------------------------------------------------------
+# Discovery question
+# -------------------------------------------------------------------
 def next_discovery_question(state: dict) -> Optional[str]:
-    if not state.get("role_keywords"):
-        return "What kind of role or work are you looking for?"
-    if not state.get("location"):
-        return "What location should I search, or is remote okay?"
+    if not state.get("role_keywords"): return "What kind of role or work are you looking for?"
+    if not state.get("location"): return "What location should I search, or is remote okay?"
     return None
-
 
 async def generate_coached_reply(state: dict, conversation_history: List[dict], user_message: str) -> str:
     """Generate a guided AI response using system prompt."""
