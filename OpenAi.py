@@ -101,12 +101,16 @@ async def extract_signals(message: str, state: dict) -> None:
         state["income_type"] = normalize_income_type(message)
 
     # --- AI extraction first
+    # --- AI dynamic keyword extraction
     try:
         ai_keywords = await extract_dynamic_keywords(message)
-        role = ai_keywords.get("role")
-        location = ai_keywords.get("location")
-        if role: state["role_keywords"] = await normalize_role_with_ai(role)
-        if location: state["location"] = location.title()
+        ai_role = ai_keywords.get("role")
+        if ai_role and not state.get("role_keywords"):
+            state["role_keywords"] = await normalize_role_with_ai(ai_role)
+
+        ai_location = ai_keywords.get("location")
+        if ai_location and not state.get("location"):
+            state["location"] = ai_location.title()
     except Exception as e:
         print(f"[DEBUG] AI keyword extraction failed: {e}")
 
