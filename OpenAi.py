@@ -99,50 +99,39 @@ async def extract_dynamic_keywords(user_message: str) -> Dict[str,str]:
         return {}
 
 async def extract_signals(message: str, state: dict) -> None:
+    """
+    1️⃣ Use AI to extract role, location, income type.
+    2️⃣ Only fallback to regex if AI fails.
+    """
     low = (message or "").lower()
 
-    # Role (regex fallback)
+    # --- Income type
+    if not state.get("income_type"):
+        state["income_type"] = normalize_income_type(message)
+
+    # --- AI dynamic keyword extraction (primary)
+    try:
+        ai_keywords = await extract_dynamic_keywords(message)
+        role = ai_keywords.get("role")
+        location = ai_keywords.get("location")
+        if role: state["role_keywords"] = await normalize_role_with_ai(role)
+        if location: state["location"] = location.title()
+    except Exception as e:
+        print(f"[DEBUG] AI keyword extraction failed: {e}")
+
+    # --- Regex fallback (secondary)
     if not state.get("role_keywords"):
         role_match = re.search(
-            r"\b(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as|full[- ]?time job as)\s+(.+?)" + _STOP,
+            r"(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as|full[- ]?time job as)\s+(.+?)" + _STOP,
             low, re.I
         )
         if role_match:
             state["role_keywords"] = await normalize_role_with_ai(normalize_role_for_api(role_match.group(1)))
 
-    # Fallback role
-    if not state.get("role_keywords") and state.get("location"):
-        inferred = _strip_fillers(re.split(r"\b(?:in|near|based in|based)\b", low, 1)[0])
-        if inferred:
-            state["role_keywords"] = await normalize_role_with_ai(normalize_role_for_api(inferred))
-
-    # --- Income type normalization
-    if not state.get("income_type"):
-        state["income_type"] = normalize_income_type(message)
-
-    # --- Location extraction
     if not state.get("location"):
-        if "remote" in low:
-            state["location"] = "Remote"
-        elif "hybrid" in low:
-            state["location"] = "Hybrid"
-        else:
-            loc_match = re.search(r"\b(?:in|near|based in|based)\s+(.+?)" + _STOP, low, re.I)
-            if loc_match:
-                state["location"] = loc_match.group(1).strip().title()
-
-    # --- AI dynamic keyword extraction
-    try:
-        ai_keywords = await extract_dynamic_keywords(message)
-        for k, v in ai_keywords.items():
-            if v and k in DYNAMIC_KEYWORDS:
-                state[k] = v
-    except Exception as e:
-        print(f"[DEBUG] AI keyword extraction failed: {e}")
-
-    # --- Remove junk roles
-    if (state.get("role_keywords") or "").lower() in BAD_ROLE_KEYWORDS:
-        state["role_keywords"] = None
+        loc_match = re.search(r"\b(?:in|near|based in|based)\s+(.+?)" + _STOP, low, re.I)
+        if loc_match:
+            state["location"] = loc_match.group(1).strip().title()
 
     # --- Ready phase
     if state.get("role_keywords") and state.get("location"):
