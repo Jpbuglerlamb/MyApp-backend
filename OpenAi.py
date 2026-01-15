@@ -211,7 +211,7 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
     state = get_state(user_id)
     low = (user_message or "").lower()
 
-    # Reset search if new intent
+    # Reset search if user triggers new intent
     if NEW_SEARCH_RE.search(low):
         state.update({
             "jobs_shown": False,
@@ -219,42 +219,63 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             "cached_jobs": []
         })
 
-    # Update signals
+    # Extract signals from user message
     extract_signals(user_message, state)
 
-    # Determine phase
-    if state.get("readiness") and state.get("role_keywords") and state.get("location"):
+    # Force ready phase if role_keywords and location exist
+    if state.get("role_keywords") and state.get("location"):
         state["phase"] = "ready"
+        state["readiness"] = True
 
-    # Already shown jobs, no new search
+    # Debug
+    print(f"[DEBUG] user_message={user_message}, role_keywords={state.get('role_keywords')}, location={state.get('location')}, phase={state.get('phase')}")
+
+    # If we already presented jobs and no new search intent, return cached jobs
     if state.get("phase") == "results" and not NEW_SEARCH_RE.search(low):
         return {
-            "assistantText": "",
+            "assistantText": "Here are your previously suggested jobs.",
             "mode": "results",
             "jobs": state.get("cached_jobs", [])
         }
 
-    # Discovery phase
+    # Discovery phase: ask missing questions
     if state.get("phase") == "discovery":
         q = next_discovery_question(state)
         if q:
             return {"assistantText": q, "mode": "chat", "jobs": []}
-        state["phase"] = "ready"
+        state["phase"] = "ready"  # Move to ready if all signals captured
 
     # Ready to fetch jobs
-    if state["phase"] == "ready":
-        jobs = await fetch_jobs(state["role_keywords"], state["location"]) or []
+    if state.get("phase") == "ready":
+        role = state.get("role_keywords")
+        location = state.get("location")
+        jobs = await fetch_jobs(role, location) or []
+
         state.update({
             "jobs_shown": True,
             "phase": "results",
             "cached_jobs": jobs
         })
+
+        assistant_text = (
+            f"Here are some options that match your search for a {role} in {location}."
+            if jobs else
+            f"Sorry, I couldn't find any jobs for a {role} in {location}."
+        )
+
         return {
-            "assistantText": "Here are some options that match what you’re looking for.",
+            "assistantText": assistant_text,
             "mode": "results" if jobs else "no_results",
             "jobs": jobs
         }
 
     # Fallback: generate AI response
     reply = await generate_coached_reply(state, conversation_history, user_message)
-    return {"assistantText": reply, "mode": "chat", "jobs": []}
+    if not reply or reply.strip() == "":
+        reply = "Hello! I can help you find jobs or gigs. What role are you interested in?"
+
+    return {
+        "assistantText": reply.strip(),
+        "mode": "chat",
+        "jobs": []
+    }
