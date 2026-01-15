@@ -1,12 +1,12 @@
-from openai import AsyncOpenAI
-from dotenv import load_dotenv
-import os
-import httpx
-import re
-from typing import List, Dict, Any, Optional
 import asyncio
 import json
+import os
+import re
+from typing import List, Dict, Any, Optional
 
+import httpx
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
 from memory_store import get_state
 
 # -------------------------------------------------------------------
@@ -28,7 +28,7 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 _STOP = r"(?:\s+(?:in|near|based in|based)\b|[.,;!?]|$)"
 BAD_ROLE_KEYWORDS = {"a job", "job", "jobs", "work", "position", "role", "career", "employment"}
 NEW_SEARCH_RE = re.compile(r"\b(find|search|look for|can you find|what about)\b", re.I)
-DYNAMIC_KEYWORDS = ["jobs","gigs","role","industry","location","salary","qualifications","experience","knowledge"]
+DYNAMIC_KEYWORDS = ["jobs", "gigs", "role", "industry", "location", "salary", "qualifications", "experience", "knowledge"]
 
 # -------------------------------------------------------------------
 # Helpers
@@ -42,16 +42,12 @@ def _strip_fillers(text: str) -> str:
     return re.sub(r"\s+"," ",t).strip()
 
 def normalize_role_for_api(role: str) -> str:
-    """Clean role string from extra words before sending to Adzuna"""
     role = role.lower()
     fillers = ["part time job as","full time job as","job as","a","an","the"]
     for f in fillers:
         role = role.replace(f,"")
     return role.strip()
 
-# -------------------------------------------------------------------
-# Income normalization
-# -------------------------------------------------------------------
 STANDARD_INCOME_TYPES = {
     "full-time": ["full time", "full-time", "permanent"],
     "part-time": ["part time", "part-time", "casual", "zero hour"],
@@ -68,11 +64,7 @@ def normalize_income_type(user_text: str) -> str:
                 return key
     return "job"
 
-# -------------------------------------------------------------------
-# AI normalization helpers
-# -------------------------------------------------------------------
 async def normalize_role_with_ai(role: str) -> str:
-    """Clean up and correct job title using GPT"""
     if not role: return ""
     prompt = f"Correct typos and clean up this job role for a job search: '{role}'. Return only the corrected title."
     try:
@@ -98,18 +90,17 @@ async def extract_dynamic_keywords(user_message: str) -> Dict[str,str]:
     except Exception:
         return {}
 
+# -------------------------------------------------------------------
+# Signal extraction
+# -------------------------------------------------------------------
 async def extract_signals(message: str, state: dict) -> None:
-    """
-    1️⃣ Use AI to extract role, location, income type.
-    2️⃣ Only fallback to regex if AI fails.
-    """
     low = (message or "").lower()
 
     # --- Income type
     if not state.get("income_type"):
         state["income_type"] = normalize_income_type(message)
 
-    # --- AI dynamic keyword extraction (primary)
+    # --- AI extraction first
     try:
         ai_keywords = await extract_dynamic_keywords(message)
         role = ai_keywords.get("role")
@@ -119,19 +110,23 @@ async def extract_signals(message: str, state: dict) -> None:
     except Exception as e:
         print(f"[DEBUG] AI keyword extraction failed: {e}")
 
-    # --- Regex fallback (secondary)
+    # --- Fallback regex
     if not state.get("role_keywords"):
         role_match = re.search(
-            r"(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as|full[- ]?time job as)\s+(.+?)" + _STOP,
+            r"(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as|full[- ]?time job as)\s+(.+?)"+_STOP,
             low, re.I
         )
         if role_match:
             state["role_keywords"] = await normalize_role_with_ai(normalize_role_for_api(role_match.group(1)))
 
     if not state.get("location"):
-        loc_match = re.search(r"\b(?:in|near|based in|based)\s+(.+?)" + _STOP, low, re.I)
+        loc_match = re.search(r"\b(?:in|near|based in|based)\s+(.+?)"+_STOP, low, re.I)
         if loc_match:
             state["location"] = loc_match.group(1).strip().title()
+
+    # --- Remove junk roles
+    if (state.get("role_keywords") or "").lower() in BAD_ROLE_KEYWORDS:
+        state["role_keywords"] = None
 
     # --- Ready phase
     if state.get("role_keywords") and state.get("location"):
