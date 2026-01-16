@@ -392,17 +392,16 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             return {"assistantText": question, "mode": "chat", "jobs": [], "debug": {"role": state.get("role_keywords"), "location": state.get("location")}}
         state["phase"] = "ready"
 
-    # Ready phase: fetch jobs internally using broader variants
+    # Ready phase: fetch jobs internally using broadened variants
     if state.get("phase") == "ready" and state.get("role_keywords") and state.get("location"):
-        user_role = state["role_keywords"]  # keep original for frontend
-        variants = await broaden_role_with_ai(user_role, state["location"])  # broaden only for search
-        variants = [v.strip() for v in variants if v.strip()]
+        user_role = state["role_keywords"]  # for display
+        variants = await broaden_role_with_ai(user_role, state["location"])  # internal broaden
         all_jobs = []
         for v in variants:
             jobs = await fetch_jobs(v, state["location"], state.get("income_type") or "job")
             all_jobs.extend(jobs)
 
-        # Deduplicate jobs
+        # Deduplicate
         unique_jobs = { (job['title'], job['company'], job['location']): job for job in all_jobs }
         all_jobs = list(unique_jobs.values())
 
@@ -416,7 +415,7 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             "mode": mode,
             "jobs": all_jobs,
             "debug": {
-                "role": user_role,  # display user role
+                "role": user_role,
                 "location": state["location"],
                 "query_count": len(all_jobs)
             }
