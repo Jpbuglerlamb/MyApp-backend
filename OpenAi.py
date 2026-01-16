@@ -147,7 +147,7 @@ async def extract_dynamic_keywords(user_message: str) -> Dict[str,str]:
 # -------------------------------------------------------------------
 async def extract_signals(message: str, state: dict) -> None:
     low = (message or "").lower().strip()
-    
+
     # --- 1️⃣ Income type
     if not state.get("income_type"):
         state["income_type"] = normalize_income_type(message)
@@ -167,7 +167,7 @@ async def extract_signals(message: str, state: dict) -> None:
     # --- 4️⃣ Apply AI role if detected, only if meaningful
     if ai_role:
         ai_role_clean = _strip_fillers(ai_role)
-        if ai_role_clean and len(ai_role_clean) > 2:  # only call GPT if meaningful
+        if ai_role_clean and len(ai_role_clean) > 2:
             cleaned_role = await normalize_role_with_ai(ai_role_clean)
             state["role_keywords"] = map_role_synonym(cleaned_role)
         else:
@@ -224,6 +224,11 @@ async def extract_signals(message: str, state: dict) -> None:
     if state.get("role_keywords") and state.get("location"):
         state["phase"] = "ready"
         state["readiness"] = True
+
+    # --- 1️⃣1️⃣ Friendly greeting for first message
+    if not state.get("greeted"):
+        state["greeted"] = True
+        print("[DEBUG] Friendly greeting applied.")
 
     print(f"[DEBUG] extract_signals final: {state}")
 
