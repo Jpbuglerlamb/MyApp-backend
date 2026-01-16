@@ -293,17 +293,24 @@ async def fetch_jobs(role_keywords: str, location: str, income_type: str = "job"
 # Main chat entry
 # -------------------------------------------------------------------
 async def chat_with_user(*, user_id: str, user_message: str, conversation_history: list) -> dict:
-    """
-    Main chat logic:
-    1️⃣ Extract signals (role, location, income_type)
-    2️⃣ Determine phase: discovery, ready, results
-    3️⃣ Fetch jobs from Adzuna using role + location + income_type
-    4️⃣ Fallback to AI-generated reply if needed
-    """
     state = get_state(user_id)
     low = (user_message or "").lower().strip()
 
-    # --- Reset search if user starts a new query
+    # --- Greeting resets conversation
+    if low in {"hi", "hello", "hey", "hiya"}:
+        state.clear()
+        state.update({
+            "phase": "discovery",
+            "jobs_shown": False,
+            "cached_jobs": []
+        })
+
+    # --- First message: AI intro
+    if not conversation_history:
+        reply = await generate_coached_reply(state, [], user_message)
+        return {"assistantText": reply, "mode": "chat", "jobs": []}
+
+    # --- Reset search if user explicitly starts a new one
     if NEW_SEARCH_RE.search(low):
         state.update({
             "jobs_shown": False,
@@ -311,61 +318,54 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             "cached_jobs": []
         })
 
-    # --- Extract role, location, income_type using robust extractor
+    # --- Extract signals
     await extract_signals(user_message, state)
 
-    # --- Debug
-    print(f"[DEBUG] chat_with_user: user_message='{user_message}', role_keywords='{state.get('role_keywords')}', "
-          f"location='{state.get('location')}', income_type='{state.get('income_type')}', phase='{state.get('phase')}'")
+    print(
+        f"[DEBUG] chat_with_user: user_message='{user_message}', "
+        f"role_keywords='{state.get('role_keywords')}', "
+        f"location='{state.get('location')}', "
+        f"income_type='{state.get('income_type')}', "
+        f"phase='{state.get('phase')}'"
+    )
 
-    # --- Already shown jobs
+    # --- Results already shown
     if state.get("phase") == "results" and not NEW_SEARCH_RE.search(low):
         return {
-            "assistantText": "Here are your previously suggested jobs.",
+            "assistantText": "Here are the roles I found earlier. Want to refine or try something else?",
             "mode": "results",
             "jobs": state.get("cached_jobs", [])
         }
 
-    # --- Discovery phase: ask missing questions
-    if state.get("phase") == "discovery":
-        question = next_discovery_question(state)
-        if question:
-            state["last_question"] = question
-            return {"assistantText": question, "mode": "chat", "jobs": []}
-        state["phase"] = "ready"  # move to ready if all signals captured
-
-    # --- Ready phase: fetch jobs from Adzuna
+    # --- Ready phase logic
     if state.get("phase") == "ready":
-        role = state.get("role_keywords")
-        location = state.get("location")
-        income_type = state.get("income_type") or "job"
+        if NEW_SEARCH_RE.search(low):
+            role = state.get("role_keywords")
+            location = state.get("location")
+            income_type = state.get("income_type") or "job"
 
-        jobs = await fetch_jobs(role, location, income_type)
-        state.update({
-            "jobs_shown": True,
-            "phase": "results",
-            "cached_jobs": jobs
-        })
+            jobs = await fetch_jobs(role, location, income_type)
+            state.update({
+                "jobs_shown": True,
+                "phase": "results",
+                "cached_jobs": jobs
+            })
 
-        assistant_text = (
-            f"Here are some {income_type} options for a '{role}' in {location}."
-            if jobs else
-            f"Sorry, I couldn't find any {income_type} jobs for a '{role}' in {location}."
-        )
+            assistant_text = (
+                f"Here are some {income_type} options for a '{role}' in {location}."
+                if jobs else
+                f"Sorry, I couldn't find any {income_type} jobs for a '{role}' in {location}."
+            )
 
-        return {
-            "assistantText": assistant_text,
-            "mode": "results" if jobs else "no_results",
-            "jobs": jobs
-        }
+            return {
+                "assistantText": assistant_text,
+                "mode": "results" if jobs else "no_results",
+                "jobs": jobs
+            }
 
-    # --- Fallback: generate AI reply
+        reply = await generate_coached_reply(state, conversation_history, user_message)
+        return {"assistantText": reply, "mode": "chat", "jobs": []}
+
+    # --- Discovery or fallback
     reply = await generate_coached_reply(state, conversation_history, user_message)
-    if not reply or reply.strip() == "":
-        reply = "Hello! I can help you find jobs or gigs. What role are you interested in?"
-
-    return {
-        "assistantText": reply.strip(),
-        "mode": "chat",
-        "jobs": []
-    }
+    return {"assistantText": reply, "mode": "chat", "jobs": []}
