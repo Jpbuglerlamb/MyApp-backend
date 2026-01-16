@@ -6,8 +6,7 @@ import uuid
 import traceback
 
 from memory_store import (
-    get_memory, append_message, clear_memory,
-    get_state, clear_state
+    get_user_memory, append_user_memory, clear_user_memory, clear_user_state
 )
 from OpenAi import chat_with_user
 
@@ -54,7 +53,7 @@ class AuthResponse(BaseModel):
     message: str
 
 # -------------------------------------------------------------------
-# In-memory user store (for demo)
+# In-memory user store (demo only)
 # -------------------------------------------------------------------
 USER_STORE = {}  # username -> {"password": str, "session_id": str}
 
@@ -80,8 +79,8 @@ async def signup(credentials: UserCredentials):
     USER_STORE[username] = {"password": credentials.password, "session_id": session_id}
 
     # Initialize memory/state for new user
-    clear_memory(session_id)
-    clear_state(session_id)
+    clear_user_memory(session_id)
+    clear_user_state(session_id)
 
     return AuthResponse(sessionId=session_id, message="Sign-up successful")
 
@@ -118,13 +117,13 @@ async def chat(request: ChatRequest):
 
     # 1️⃣ Store user message safely
     try:
-        append_message(session_id, "user", user_message)
+        append_user_memory(session_id, "user", user_message)
     except Exception:
-        pass  # fail silently if memory store fails
+        pass  # fail silently
 
     # 2️⃣ Load conversation history safely
     try:
-        conversation_history = get_memory(session_id) or []
+        conversation_history = get_user_memory(session_id) or []
     except Exception:
         conversation_history = []
 
@@ -132,7 +131,8 @@ async def chat(request: ChatRequest):
     try:
         response = await chat_with_user(
             session_id=session_id,
-            user_message=user_message
+            user_message=user_message,
+            conversation_history=conversation_history
         )
     except Exception as e:
         tb = traceback.format_exc()
@@ -147,7 +147,7 @@ async def chat(request: ChatRequest):
     # 4️⃣ Store assistant reply safely
     assistant_text = response.get("assistantText") or "Sorry, I couldn't generate a response."
     try:
-        append_message(session_id, "assistant", assistant_text)
+        append_user_memory(session_id, "assistant", assistant_text)
     except Exception:
         pass
 
@@ -183,8 +183,8 @@ async def chat(request: ChatRequest):
 @app.post("/reset-chat/{session_id}", summary="Reset chat memory and state")
 async def reset_chat(session_id: str):
     try:
-        clear_memory(session_id)
-        clear_state(session_id)
+        clear_user_memory(session_id)
+        clear_user_state(session_id)
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[ERROR] reset_chat failed:\n{tb}")
