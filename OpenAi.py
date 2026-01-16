@@ -148,21 +148,29 @@ async def extract_dynamic_keywords(user_message: str) -> Dict[str,str]:
 # -------------------------------------------------------------------
 async def extract_signals(message: str, state: dict) -> None:
     low = (message or "").lower().strip()
+    
+    # --- 1️⃣ Income type
     if not state.get("income_type"):
         state["income_type"] = normalize_income_type(message)
 
+    # --- 2️⃣ Clean message for AI and regex
+    clean_message = _strip_fillers(message)
+
+    # --- 3️⃣ AI dynamic keyword extraction
     ai_role, ai_location = None, None
     try:
-        ai_keywords = await extract_dynamic_keywords(message)
+        ai_keywords = await extract_dynamic_keywords(clean_message)
         ai_role = ai_keywords.get("role")
         ai_location = ai_keywords.get("location")
     except Exception as e:
         print(f"[DEBUG] AI keyword extraction failed: {e}")
 
+    # --- 4️⃣ Apply AI role if detected
     if ai_role:
         cleaned_role = await normalize_role_with_ai(ai_role)
         state["role_keywords"] = map_role_synonym(cleaned_role)
 
+    # --- 5️⃣ Regex fallback (original pattern)
     role_match = re.search(
         r"(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as|full[- ]?time job as)\s+(.+?)" + _STOP,
         low, re.I
@@ -174,6 +182,17 @@ async def extract_signals(message: str, state: dict) -> None:
         if standardized_role.lower() not in BAD_ROLE_KEYWORDS:
             state["role_keywords"] = standardized_role
 
+    # --- 6️⃣ Extra regex fallback for "I want / I need / I am looking for ..."
+    if not state.get("role_keywords"):
+        fallback_match = re.search(r"i (?:want|am looking for|need) (.+?) (?:job|role|position)?", low, re.I)
+        if fallback_match:
+            fallback_role = normalize_role_for_api(fallback_match.group(1))
+            fallback_role = await normalize_role_with_ai(fallback_role)
+            standardized_role = map_role_synonym(fallback_role)
+            if standardized_role.lower() not in BAD_ROLE_KEYWORDS:
+                state["role_keywords"] = standardized_role
+
+    # --- 7️⃣ Location extraction
     loc = None
     if ai_location:
         loc = ai_location.strip().title()
@@ -185,9 +204,11 @@ async def extract_signals(message: str, state: dict) -> None:
         matches = difflib.get_close_matches(loc, UK_CITIES, n=1, cutoff=0.7)
         state["location"] = matches[0] if matches else loc
 
+    # --- 8️⃣ Sanity check: remove junk roles
     if (state.get("role_keywords") or "").lower() in BAD_ROLE_KEYWORDS:
         state["role_keywords"] = None
 
+    # --- 9️⃣ Ready phase
     if state.get("role_keywords") and state.get("location"):
         state["phase"] = "ready"
         state["readiness"] = True
