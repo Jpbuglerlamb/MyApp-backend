@@ -104,9 +104,10 @@ def map_role_synonym(role: str, cutoff: float = 0.7) -> str:
             highest_ratio = ratio
     return best_match if best_match else role.title()
 
-
 async def normalize_role_with_ai(role: str) -> str:
-    if not role: return ""
+    role = role.strip()
+    if not role or len(role) < 2:
+        return role  # Return original if too short
     prompt = (
         "Clean and normalize this job role for a job search. "
         "Remove words like 'job', 'jobs', 'position', or 'role'. "
@@ -124,9 +125,7 @@ async def normalize_role_with_ai(role: str) -> str:
         cleaned = re.sub(r"\bjobs?\b", "", cleaned, flags=re.I).strip()
         return cleaned
     except Exception:
-        cleaned = role.strip().strip("\"'")
-        cleaned = re.sub(r"\bjobs?\b", "", cleaned, flags=re.I).strip()
-        return cleaned
+        return role  # fallback: return original role
 
 
 async def extract_dynamic_keywords(user_message: str) -> Dict[str,str]:
@@ -165,10 +164,14 @@ async def extract_signals(message: str, state: dict) -> None:
     except Exception as e:
         print(f"[DEBUG] AI keyword extraction failed: {e}")
 
-    # --- 4️⃣ Apply AI role if detected
+    # --- 3️⃣ Apply AI role if detected
     if ai_role:
-        cleaned_role = await normalize_role_with_ai(ai_role)
-        state["role_keywords"] = map_role_synonym(cleaned_role)
+        ai_role_clean = _strip_fillers(ai_role)
+        if ai_role_clean:  # only call GPT if non-empty
+            cleaned_role = await normalize_role_with_ai(ai_role_clean)
+            state["role_keywords"] = map_role_synonym(cleaned_role)
+        else:
+            state["role_keywords"] = map_role_synonym(ai_role)  # fallback without GPT
 
     # --- 5️⃣ Regex fallback (original pattern)
     role_match = re.search(
