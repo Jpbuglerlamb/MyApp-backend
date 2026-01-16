@@ -151,14 +151,10 @@ async def extract_dynamic_keywords(user_message: str) -> Dict[str,str]:
 async def extract_signals(message: str, state: dict) -> None:
     low = (message or "").lower().strip()
 
-    # --- 1️⃣ Income type
     if not state.get("income_type"):
         state["income_type"] = normalize_income_type(message)
 
-    # --- 2️⃣ Clean message for AI and regex
     clean_message = _strip_fillers(message)
-
-    # --- 3️⃣ AI dynamic keyword extraction
     ai_role, ai_location = None, None
     try:
         ai_keywords = await extract_dynamic_keywords(clean_message)
@@ -167,7 +163,6 @@ async def extract_signals(message: str, state: dict) -> None:
     except Exception as e:
         print(f"[DEBUG] AI keyword extraction failed: {e}")
 
-    # --- 4️⃣ Apply AI role if detected, only if meaningful
     if ai_role:
         ai_role_clean = _strip_fillers(ai_role)
         if ai_role_clean and len(ai_role_clean) > 2:
@@ -176,7 +171,7 @@ async def extract_signals(message: str, state: dict) -> None:
         else:
             state["role_keywords"] = map_role_synonym(ai_role)
 
-    # --- 5️⃣ Regex fallback (original patterns)
+    # Regex fallback patterns
     role_match = re.search(
         r"(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as|full[- ]?time job as)\s+(.+?)" + _STOP,
         low, re.I
@@ -189,29 +184,25 @@ async def extract_signals(message: str, state: dict) -> None:
         if standardized_role.lower() not in BAD_ROLE_KEYWORDS:
             state["role_keywords"] = standardized_role
 
-    # --- 6️⃣ Regex fallback for "I want / I need / I'm looking for ..."
-    if not state.get("role_keywords"):
-        fallback_match = re.search(
-            r"i(?:'m| am)? (?:looking for|want|need) (.+?) (?:job|role|position)?",
-            low, re.I
-        )
-        if fallback_match:
-            fallback_role = normalize_role_for_api(fallback_match.group(1))
-            if fallback_role and len(fallback_role) > 2:
-                fallback_role = await normalize_role_with_ai(fallback_role)
-            standardized_role = map_role_synonym(fallback_role)
-            if standardized_role.lower() not in BAD_ROLE_KEYWORDS:
-                state["role_keywords"] = standardized_role
+    fallback_match = re.search(
+        r"i(?:'m| am)? (?:looking for|want|need) (.+?) (?:job|role|position)?",
+        low, re.I
+    )
+    if fallback_match and not state.get("role_keywords"):
+        fallback_role = normalize_role_for_api(fallback_match.group(1))
+        if fallback_role and len(fallback_role) > 2:
+            fallback_role = await normalize_role_with_ai(fallback_role)
+        standardized_role = map_role_synonym(fallback_role)
+        if standardized_role.lower() not in BAD_ROLE_KEYWORDS:
+            state["role_keywords"] = standardized_role
 
-    # --- 7️⃣ Final fallback: map entire cleaned message if still None
     if not state.get("role_keywords"):
         state["role_keywords"] = map_role_synonym(_strip_fillers(message))
 
-    # --- 8️⃣ Location extraction
     loc = None
     if ai_location:
         loc = ai_location.strip().title()
-    elif not state.get("location"):
+    else:
         loc_match = re.search(r"\b(?:in|near|based in|based)\s+(.+?)" + _STOP, low, re.I)
         if loc_match:
             loc = loc_match.group(1).strip().title()
@@ -219,21 +210,88 @@ async def extract_signals(message: str, state: dict) -> None:
         matches = difflib.get_close_matches(loc, UK_CITIES, n=1, cutoff=0.7)
         state["location"] = matches[0] if matches else loc
 
-    # --- 9️⃣ Sanity check: remove junk roles
     if (state.get("role_keywords") or "").lower() in BAD_ROLE_KEYWORDS:
         state["role_keywords"] = None
 
-    # --- 🔟 Ready phase
     if state.get("role_keywords") and state.get("location"):
         state["phase"] = "ready"
         state["readiness"] = True
 
-    # --- 1️⃣1️⃣ Friendly greeting for first message
     if not state.get("greeted"):
         state["greeted"] = True
         print("[DEBUG] Friendly greeting applied.")
 
     print(f"[DEBUG] extract_signals final: {state}")
+# -------------------------------------------------------------------
+# Broader AI Role
+# -------------------------------------------------------------------
+async def broaden_role_with_ai(role: str, location: str) -> List[str]:
+    if not role:
+        return []
+    prompt = f"""
+You are a global job search assistant. A user wants jobs in {location}. 
+The user typed this role: '{role}'.
+Return 2-3 broader, search-friendly variants. Comma-separated, lowercase, no punctuation.
+"""
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0
+        )
+        return [x.strip() for x in response.choices[0].message.content.strip().split(",") if x.strip()]
+    except Exception:
+        return [role.lower()]
+# -------------------------------------------------------------------
+# Job fetching
+# -------------------------------------------------------------------
+async def fetch_jobs(role_keywords: str, location: str, income_type: str = "job") -> List[Dict[str, Any]]:
+    if not role_keywords or not location:
+        return []
+
+    role_keywords = normalize_role_for_api(role_keywords)
+    income_map = {
+        "full-time": "fulltime",
+        "part-time": "parttime",
+        "temporary": "temporary",
+        "freelance": "freelance",
+        "internship": "internship",
+        "job": ""
+    }
+    adzuna_income = income_map.get(income_type.lower(), "")
+    query = f"{role_keywords} {adzuna_income}" if adzuna_income else role_keywords
+
+    url = "https://api.adzuna.com/v1/api/jobs/gb/search/1"
+    params = {
+        "app_id": ADZUNA_APP_ID,
+        "app_key": ADZUNA_APP_KEY,
+        "what": query,
+        "where": location.title(),
+        "results_per_page": 38,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client_http:
+            response = await client_http.get(url, params=params)
+            response.raise_for_status()
+            results = response.json().get("results", []) or []
+
+            normalized_jobs = []
+            for job in results:
+                title = job.get("title", "") or ""
+                company = job.get("company", {}).get("display_name") if isinstance(job.get("company"), dict) else job.get("company", "")
+                loc = job.get("location", {}).get("display_name") if isinstance(job.get("location"), dict) else job.get("location", "")
+                redirect_url = job.get("redirect_url", "")
+                normalized_jobs.append({
+                    "title": title.strip(),
+                    "company": company.strip() if company else "",
+                    "location": loc.strip() if loc else "",
+                    "redirect_url": redirect_url.strip() if redirect_url else ""
+                })
+            return normalized_jobs
+    except Exception as e:
+        print(f"[DEBUG] fetch_jobs failed for query='{query}' location='{location}': {e}")
+        return []
 
 # -------------------------------------------------------------------
 # Discovery question
@@ -307,65 +365,6 @@ Search Trigger Rules
     )
     return response.choices[0].message.content.strip()
 
-
-# -------------------------------------------------------------------
-# Job fetching
-# -------------------------------------------------------------------
-async def fetch_jobs(role_keywords: str, location: str, income_type: str = "job") -> List[Dict[str, Any]]:
-    if not role_keywords or not location:
-        return []
-
-    role_keywords = normalize_role_for_api(role_keywords)
-    income_map = {
-        "full-time": "fulltime",
-        "part-time": "parttime",
-        "temporary": "temporary",
-        "freelance": "freelance",
-        "internship": "internship",
-        "job": ""  # default no filter
-    }
-
-    adzuna_income = income_map.get(income_type.lower(), "")
-
-    # --- Only append income filter if user explicitly requested full-time/part-time/freelance
-    if adzuna_income in {"fulltime", "parttime", "temporary", "freelance", "internship"}:
-        query = f"{role_keywords} {adzuna_income}"
-    else:
-        query = role_keywords
-
-    url = "https://api.adzuna.com/v1/api/jobs/gb/search/1"
-    params = {
-        "app_id": ADZUNA_APP_ID,
-        "app_key": ADZUNA_APP_KEY,
-        "what": query,
-        "where": location.title(),
-        "results_per_page": 38,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client_http:
-            response = await client_http.get(url, params=params)
-            response.raise_for_status()
-            results = response.json().get("results", []) or []
-
-            normalized_jobs = []
-            for job in results:
-                title = job.get("title", "") or ""
-                company = job.get("company", {}).get("display_name") if isinstance(job.get("company"), dict) else job.get("company", "")
-                loc = job.get("location", {}).get("display_name") if isinstance(job.get("location"), dict) else job.get("location", "")
-                redirect_url = job.get("redirect_url", "")
-                normalized_jobs.append({
-                    "title": title.strip(),
-                    "company": company.strip() if company else "",
-                    "location": loc.strip() if loc else "",
-                    "redirect_url": redirect_url.strip() if redirect_url else ""
-                })
-            return normalized_jobs
-    except Exception as e:
-        print(f"[DEBUG] fetch_jobs failed for query='{query}' location='{location}': {e}")
-        return []
-
-
 # -------------------------------------------------------------------
 # Main chat entry
 # -------------------------------------------------------------------
@@ -373,51 +372,48 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
     state = get_state(user_id)
     low = (user_message or "").lower().strip()
 
-    # Reset conversation on greetings
+    # Greetings
     if low in {"hi", "hello", "hey", "hiya"}:
         state.clear()
         state.update({"phase": "discovery", "jobs_shown": False, "cached_jobs": [], "last_question": None})
+        return {"assistantText": "Hello! I'm here to help you find jobs or gigs. What role are you interested in?", "mode": "chat", "jobs": [], "debug": {}}
 
-    # First message: AI intro
-    if not conversation_history:
-        reply = await generate_coached_reply(state, [], user_message)
-        return {"assistantText": reply, "mode": "chat", "jobs": [], "debug": {}}
-
-    # Reset search if user starts a new query
+    # Reset search if new query
     if NEW_SEARCH_RE.search(low):
         state.update({"jobs_shown": False, "phase": "discovery", "cached_jobs": [], "last_question": None})
 
-    # Extract signals
     await extract_signals(user_message, state)
 
-    # Debug
-    print(f"[DEBUG] chat_with_user: user_message='{user_message}', role_keywords='{state.get('role_keywords')}', location='{state.get('location')}', phase='{state.get('phase')}'")
-
-    # Discovery phase
+    # Discovery questions
     if state.get("phase") == "discovery":
         question = next_discovery_question(state)
         if question:
             state["last_question"] = question
             return {"assistantText": question, "mode": "chat", "jobs": [], "debug": {"role": state.get("role_keywords"), "location": state.get("location")}}
-
         state["phase"] = "ready"
 
-    # Ready phase: fetch jobs automatically
+    # Ready phase: fetch jobs with broadening
     if state.get("phase") == "ready" and state.get("role_keywords") and state.get("location"):
-        role = state["role_keywords"]
-        location = state["location"]
-        income_type = state.get("income_type") or "job"
+        variants = await broaden_role_with_ai(state["role_keywords"], state["location"])
+        variants = [v.strip() for v in variants if v.strip()]
+        all_jobs = []
+        for v in variants:
+            jobs = await fetch_jobs(v, state["location"], state.get("income_type") or "job")
+            all_jobs.extend(jobs)
 
-        jobs = await fetch_jobs(role, location, income_type)
-        state.update({"jobs_shown": True, "phase": "results", "cached_jobs": jobs})
+        # Deduplicate jobs
+        unique_jobs = { (job['title'], job['company'], job['location']): job for job in all_jobs }
+        all_jobs = list(unique_jobs.values())
 
-        assistant_text = f"Here are some {income_type} options for a '{role}' in {location}." if jobs else f"Sorry, I couldn't find any {income_type} jobs for a '{role}' in {location}."
+        state.update({"jobs_shown": True, "phase": "results", "cached_jobs": all_jobs})
 
-        return {"assistantText": assistant_text, "mode": "results" if jobs else "no_results", "jobs": jobs, "debug": {"role": role, "location": location, "query_count": len(jobs)}}
+        assistant_text = f"Here are some {state.get('income_type','job')} options for '{state['role_keywords']}' in {state['location']}." if all_jobs else f"Sorry, I couldn't find any {state.get('income_type','job')} jobs for '{state['role_keywords']}' in {state['location']}."
+        mode = "results" if all_jobs else "no_results"
 
-    # Fallback AI response
+        return {"assistantText": assistant_text, "mode": mode, "jobs": all_jobs, "debug": {"role": state["role_keywords"], "location": state["location"], "query_count": len(all_jobs)}}
+
+    # Fallback
     reply = await generate_coached_reply(state, conversation_history, user_message)
     if not reply or reply.strip() == "":
         reply = "Hello! I can help you find jobs or gigs. What role are you interested in?"
-
     return {"assistantText": reply.strip(), "mode": "chat", "jobs": [], "debug": {"role": state.get("role_keywords"), "location": state.get("location")}}
