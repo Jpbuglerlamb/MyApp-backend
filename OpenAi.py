@@ -164,10 +164,10 @@ async def extract_signals(message: str, state: dict) -> None:
     except Exception as e:
         print(f"[DEBUG] AI keyword extraction failed: {e}")
 
-    # --- 3️⃣ Apply AI role if detected
+    # --- 4️⃣ Apply AI role if detected, only if meaningful
     if ai_role:
         ai_role_clean = _strip_fillers(ai_role)
-        if ai_role_clean:  # only call GPT if non-empty
+        if ai_role_clean and len(ai_role_clean) > 2:  # only call GPT if meaningful
             cleaned_role = await normalize_role_with_ai(ai_role_clean)
             state["role_keywords"] = map_role_synonym(cleaned_role)
         else:
@@ -180,7 +180,8 @@ async def extract_signals(message: str, state: dict) -> None:
     )
     if role_match:
         fallback_role = normalize_role_for_api(role_match.group(1))
-        fallback_role = await normalize_role_with_ai(fallback_role)
+        if fallback_role and len(fallback_role) > 2:
+            fallback_role = await normalize_role_with_ai(fallback_role)
         standardized_role = map_role_synonym(fallback_role)
         if standardized_role.lower() not in BAD_ROLE_KEYWORDS:
             state["role_keywords"] = standardized_role
@@ -190,7 +191,8 @@ async def extract_signals(message: str, state: dict) -> None:
         fallback_match = re.search(r"i (?:want|am looking for|need) (.+?) (?:job|role|position)?", low, re.I)
         if fallback_match:
             fallback_role = normalize_role_for_api(fallback_match.group(1))
-            fallback_role = await normalize_role_with_ai(fallback_role)
+            if fallback_role and len(fallback_role) > 2:
+                fallback_role = await normalize_role_with_ai(fallback_role)
             standardized_role = map_role_synonym(fallback_role)
             if standardized_role.lower() not in BAD_ROLE_KEYWORDS:
                 state["role_keywords"] = standardized_role
