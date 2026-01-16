@@ -80,12 +80,15 @@ def normalize_role_for_api(role: str) -> str:
 
 
 def normalize_income_type(user_text: str) -> str:
+    """
+    Determine income type from user text. Defaults to 'job' (no filter) unless explicitly mentioned.
+    """
     low = user_text.lower()
     for key, variants in STANDARD_INCOME_TYPES.items():
         for v in variants:
             if v in low:
                 return key
-    return "job"
+    return "job"  # default: no income filter
 
 
 def map_role_synonym(role: str, cutoff: float = 0.7) -> str:
@@ -319,12 +322,16 @@ async def fetch_jobs(role_keywords: str, location: str, income_type: str = "job"
         "temporary": "temporary",
         "freelance": "freelance",
         "internship": "internship",
-        "job": ""
+        "job": ""  # default no filter
     }
+
     adzuna_income = income_map.get(income_type.lower(), "")
-    query = role_keywords
-    if adzuna_income:
-        query += f" {adzuna_income}"
+
+    # --- Only append income filter if user explicitly requested full-time/part-time/freelance
+    if adzuna_income in {"fulltime", "parttime", "temporary", "freelance", "internship"}:
+        query = f"{role_keywords} {adzuna_income}"
+    else:
+        query = role_keywords
 
     url = "https://api.adzuna.com/v1/api/jobs/gb/search/1"
     params = {
