@@ -170,7 +170,6 @@ async def extract_signals(message: str, state: dict) -> None:
             state["role_keywords"] = map_role_synonym(cleaned_role)
         else:
             state["role_keywords"] = map_role_synonym(ai_role)
-
     # Regex fallback patterns
     role_match = re.search(
         r"(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as|full[- ]?time job as)\s+(.+?)" + _STOP,
@@ -391,11 +390,19 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             state["last_question"] = question
             return {"assistantText": question, "mode": "chat", "jobs": [], "debug": {"role": state.get("role_keywords"), "location": state.get("location")}}
         state["phase"] = "ready"
-
+    # Detect explicit income-type mentions anytime
+    if "part" in low:
+        state["income_type"] = "part-time"
+        state["phase"] = "ready"
+    elif "full" in low:
+        state["income_type"] = "full-time"
+        state["phase"] = "ready"
+        
     # -------------------------------
     # NEW: Handle income type clarification
     # -------------------------------
-    income_type = state.get("income_type", "job")  # default
+    # Handle user reply to income-type question
+    income_type = state.get("income_type", "job")
     if state.get("asked_income_type") and income_type == "job":
         reply_lower = user_message.lower()
         if "part" in reply_lower:
@@ -404,6 +411,7 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             state["income_type"] = "full-time"
         else:
             state["income_type"] = "job"  # fallback
+        state["asked_income_type"] = False  # ✅ important to reset
 
 
     # Ready phase: fetch jobs internally using broadened variants
