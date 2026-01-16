@@ -392,13 +392,44 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             return {"assistantText": question, "mode": "chat", "jobs": [], "debug": {"role": state.get("role_keywords"), "location": state.get("location")}}
         state["phase"] = "ready"
 
+    # -------------------------------
+    # NEW: Handle income type clarification
+    # -------------------------------
+    income_type = state.get("income_type", "job")  # default
+    if state.get("asked_income_type") and income_type == "job":
+        reply_lower = user_message.lower()
+        if "part" in reply_lower:
+            state["income_type"] = "part-time"
+        elif "full" in reply_lower:
+            state["income_type"] = "full-time"
+        else:
+            state["income_type"] = "job"  # fallback
+
+
     # Ready phase: fetch jobs internally using broadened variants
     if state.get("phase") == "ready" and state.get("role_keywords") and state.get("location"):
         user_role = state["role_keywords"]  # for display
-        variants = await broaden_role_with_ai(user_role, state["location"])  # internal broaden
+        income_type = state.get("income_type", "job")  # default
+
+        # If income_type is default ("job"), ask the user first
+        if income_type == "job" and not state.get("asked_income_type"):
+            state["asked_income_type"] = True
+            return {
+                "assistantText": f"I've found some '{user_role}' jobs in {state['location']}. Do you want full-time or part-time work?",
+                "mode": "chat",
+                "jobs": [],
+                "debug": {
+                    "role": user_role,
+                    "location": state["location"],
+                    "query_count": 0
+                }
+            }
+
+        # Broaden the role for multiple queries
+        variants = await broaden_role_with_ai(user_role, state["location"])
         all_jobs = []
         for v in variants:
-            jobs = await fetch_jobs(v, state["location"], state.get("income_type") or "job")
+            jobs = await fetch_jobs(v, state["location"], income_type)
             all_jobs.extend(jobs)
 
         # Deduplicate
@@ -407,8 +438,19 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
 
         state.update({"jobs_shown": True, "phase": "results", "cached_jobs": all_jobs})
 
-        assistant_text = f"Here are some {state.get('income_type','job')} options for '{user_role}' in {state['location']}." if all_jobs else f"Sorry, I couldn't find any {state.get('income_type','job')} jobs for '{user_role}' in {state['location']}."
-        mode = "results" if all_jobs else "no_results"
+        # Build assistant text carefully
+        if all_jobs:
+            if income_type == "job":  # fallback, shouldn't happen after asking
+                assistant_text = f"Here are some '{user_role}' jobs in {state['location']}."
+            else:
+                assistant_text = f"Here are some {income_type} options for '{user_role}' in {state['location']}."
+            mode = "results"
+        else:
+            if income_type == "job":
+                assistant_text = f"Sorry, I couldn't find any '{user_role}' jobs in {state['location']}."
+            else:
+                assistant_text = f"Sorry, I couldn't find any {income_type} jobs for '{user_role}' in {state['location']}."
+            mode = "no_results"
 
         return {
             "assistantText": assistant_text,
@@ -420,7 +462,6 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
                 "query_count": len(all_jobs)
             }
         }
-
     # Fallback
     reply = await generate_coached_reply(state, conversation_history, user_message)
     if not reply or reply.strip() == "":
