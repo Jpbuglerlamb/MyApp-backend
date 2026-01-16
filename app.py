@@ -4,9 +4,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 import uuid
 import traceback
-
 from memory_store import (
-    get_user_memory, append_user_memory, clear_user_memory, clear_user_state
+    get_user_state,
+    get_user_memory,
+    append_user_memory,
+    clear_user_memory,
+    clear_user_state,
+    save_user_job
 )
 from OpenAi import chat_with_user
 
@@ -123,16 +127,21 @@ async def chat(request: ChatRequest):
 
     # 2️⃣ Load conversation history safely
     try:
-        conversation_history = get_user_memory(session_id) or []
+       conversation_history = get_user_memory(session_id) or []
     except Exception:
-        conversation_history = []
+       conversation_history = []
+    try:
+       state = get_user_state(session_id)
+    except Exception:
+        state = {}
+
 
     # 3️⃣ Call AI Aura backend logic
     try:
-        response = await chat_with_user(
-            session_id=session_id,
-            user_message=user_message,
-            conversation_history=conversation_history
+       response = await chat_with_user(
+           session_id=session_id,
+           user_message=user_message,
+           conversation_history=conversation_history  # explicitly pass history
         )
     except Exception as e:
         tb = traceback.format_exc()
@@ -146,10 +155,11 @@ async def chat(request: ChatRequest):
 
     # 4️⃣ Store assistant reply safely
     assistant_text = response.get("assistantText") or "Sorry, I couldn't generate a response."
-    try:
-        append_user_memory(session_id, "assistant", assistant_text)
-    except Exception:
-        pass
+    append_user_memory(session_id, "assistant", assistant_text)
+
+    # 5️⃣ Save returned jobs into user's history
+    for job in response.get("jobs") or []:
+        save_user_job(session_id, job)
 
     # 5️⃣ Normalize job suggestions safely
     normalized_jobs: List[JobSuggestion] = []
@@ -161,8 +171,8 @@ async def chat(request: ChatRequest):
                          if isinstance(job.get("company"), dict)
                          else str(job.get("company") or "")),
                 location=(str(job.get("location", {}).get("display_name"))
-                          if isinstance(job.get("location"), dict)
-                          else str(job.get("location") or "")),
+                      if isinstance(job.get("location"), dict)
+                      else str(job.get("location") or "")),
                 redirect_url=str(job.get("redirect_url") or "")
             ))
         except Exception:

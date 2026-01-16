@@ -7,7 +7,14 @@ from typing import List, Dict, Any, Optional
 import httpx
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from memory_store import get_state
+from memory_store import (
+    get_user_state,
+    get_user_memory,
+    append_user_memory,
+    clear_user_memory,
+    clear_user_state,
+    save_user_job
+)
 
 # -------------------------------------------------------------------
 # Setup
@@ -396,11 +403,13 @@ Search Trigger Rules
 # -------------------------------
 # Main chat entry (user-aware, human-friendly)
 # -------------------------------
-async def chat_with_user(*, session_id: str, user_message: str) -> dict:
+async def chat_with_user(*, session_id: str, user_message: str, conversation_history: list = None) -> dict:
     """
     Chat with AI Aura using a logged-in user's session.
-    Maintains state, memory, and job history per user.
+    Accepts explicit conversation_history for long-term control.
     """
+    memory = conversation_history or get_user_memory(session_id)
+
     # -------------------------------------------------------------------
     # 1. Access user state and memory
     # -------------------------------------------------------------------
