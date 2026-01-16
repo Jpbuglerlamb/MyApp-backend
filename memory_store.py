@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Optional
 import hashlib
 import uuid
 
@@ -13,6 +13,8 @@ import uuid
 # Each user has email, hashed password, session_id, state, memory, job history, preferences
 USERS: Dict[str, dict] = defaultdict(
     lambda: {
+        "first_name": None,   # optional
+        "last_name": None,
         "email": None,
         "password_hash": None,  # hashed password
         "session_id": None,
@@ -37,7 +39,7 @@ def verify_password(password: str, password_hash: str) -> bool:
 # -------------------------------------------------------------------
 # User account management
 # -------------------------------------------------------------------
-def create_user(email: str, password: str) -> str:
+def create_user(email: str, password: str, first_name: Optional[str] = None, last_name: Optional[str] = None) -> str:
     """
     Create a new user and return session_id.
     """
@@ -47,6 +49,8 @@ def create_user(email: str, password: str) -> str:
             raise ValueError("Email already registered.")
 
     session_id = str(uuid.uuid4())
+    USERS[session_id]["first_name"] = first_name
+    USERS[session_id]["last_name"] = last_name
     USERS[session_id]["email"] = email
     USERS[session_id]["password_hash"] = hash_password(password)
     USERS[session_id]["session_id"] = session_id

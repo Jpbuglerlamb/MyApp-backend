@@ -50,8 +50,10 @@ class ChatResponse(BaseModel):
 
 class UserCredentials(BaseModel):
     username: str
-    password: str  # plaintext for now, but you should hash for production
-
+    password: str
+    first_name: str | None = None
+    last_name: str | None = None
+    
 class AuthResponse(BaseModel):
     sessionId: str
     message: str
@@ -80,8 +82,12 @@ async def signup(credentials: UserCredentials):
         raise HTTPException(status_code=400, detail="Username already exists")
 
     session_id = str(uuid.uuid4())
-    USER_STORE[username] = {"password": credentials.password, "session_id": session_id}
-
+    USER_STORE[username] = {
+        "password": credentials.password,
+        "session_id": session_id,
+        "first_name": credentials.first_name,
+        "last_name": credentials.last_name,
+    }
     # Initialize memory/state for new user
     clear_user_memory(session_id)
     clear_user_state(session_id)
