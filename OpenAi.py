@@ -170,67 +170,100 @@ async def extract_dynamic_keywords(user_message: str) -> Dict[str,str]:
 # -------------------------------------------------------------------
 # Signal extraction
 # -------------------------------------------------------------------
-async def extract_signals(message: str, state: dict) -> None:
+# Example UK cities list for fuzzy matching
+UK_CITIES = ["Edinburgh", "London", "Manchester", "Bristol", "Glasgow", "Leeds", "Liverpool", "Belfast", "Cardiff"]
+
+async def chat_with_user(*, user_id: str, user_message: str, conversation_history: list) -> dict:
     """
-    Robust extraction of role, location, income type, and readiness.
-    Steps:
-    1️⃣ Normalize income type from user text
-    2️⃣ AI extraction of role and location
-    3️⃣ Regex fallback always runs to correct AI misreads
-    4️⃣ Final GPT cleanup of role
-    5️⃣ Set phase and readiness if both role and location exist
+    Main chat logic:
+    1️⃣ Extract signals (role, location, income_type)
+    2️⃣ Trigger job fetch automatically when ready
+    3️⃣ Fallback to AI-generated reply
+    4️⃣ Return assistantText, jobs array, mode, and debug info
     """
-    low = (message or "").lower().strip()
+    state = get_state(user_id)
+    low = (user_message or "").lower().strip()
 
-    # --- 1️⃣ Income type
-    if not state.get("income_type"):
-        state["income_type"] = normalize_income_type(message)
+    # --- 1️⃣ Detect greetings and reset conversation
+    if low in {"hi", "hello", "hey", "hiya"}:
+        state.clear()
+        state.update({
+            "phase": "discovery",
+            "jobs_shown": False,
+            "cached_jobs": []
+        })
 
-    # --- 2️⃣ AI dynamic keyword extraction (primary)
-    ai_role, ai_location = None, None
-    try:
-        ai_keywords = await extract_dynamic_keywords(message)
-        ai_role = ai_keywords.get("role")
-        ai_location = ai_keywords.get("location")
-    except Exception as e:
-        print(f"[DEBUG] AI keyword extraction failed: {e}")
+    # --- 2️⃣ First message: AI intro
+    if not conversation_history:
+        reply = await generate_coached_reply(state, [], user_message)
+        return {"assistantText": reply, "mode": "chat", "jobs": []}
 
-    # --- Tentatively set AI outputs
-    if ai_role:
-        cleaned_role = await normalize_role_with_ai(ai_role)
-        standardized_role = map_role_synonym(cleaned_role)  # fuzzy mapping
-        state["role_keywords"] = standardized_role
-    if ai_location:
-        state["location"] = ai_location.title()
+    # --- 3️⃣ Reset search if user explicitly starts a new one
+    if NEW_SEARCH_RE.search(low):
+        state.update({
+            "jobs_shown": False,
+            "phase": "discovery",
+            "cached_jobs": []
+        })
 
-    # --- 3️⃣ Regex fallback (always runs)
-    role_match = re.search(
-        r"(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as|full[- ]?time job as)\s+(.+?)" + _STOP,
-        low, re.I
+    # --- 4️⃣ Extract role, location, income_type
+    await extract_signals(user_message, state)
+
+    # --- 5️⃣ Debug print
+    print(
+        f"[DEBUG] chat_with_user: user_message='{user_message}', "
+        f"role_keywords='{state.get('role_keywords')}', "
+        f"location='{state.get('location')}', "
+        f"income_type='{state.get('income_type')}', "
+        f"phase='{state.get('phase')}'"
     )
-    if role_match:
-        fallback_role = normalize_role_for_api(role_match.group(1))
-        fallback_role = await normalize_role_with_ai(fallback_role)
-        standardized_role = map_role_synonym(fallback_role)  # fuzzy mapping
-        if standardized_role.lower() not in BAD_ROLE_KEYWORDS and standardized_role.lower() != (state.get("role_keywords") or "").lower():
-            state["role_keywords"] = standardized_role
 
-    # --- Location fallback
-    if not state.get("location"):
-        loc_match = re.search(r"\b(?:in|near|based in|based)\s+(.+?)" + _STOP, low, re.I)
-        if loc_match:
-            state["location"] = loc_match.group(1).strip().title()
+    # --- 6️⃣ If jobs already fetched, return cached results
+    if state.get("phase") == "results" and state.get("jobs_shown"):
+        return {
+            "assistantText": "Here are the roles I found earlier. Want to refine or try something else?",
+            "mode": "results",
+            "jobs": state.get("cached_jobs", []),
+            "debug": {"role": state.get("role_keywords"), "location": state.get("location")}
+        }
 
-    # --- 4️⃣ Final sanity check: remove junk roles
-    if (state.get("role_keywords") or "").lower() in BAD_ROLE_KEYWORDS:
-        state["role_keywords"] = None
+    # --- 7️⃣ Ready phase: fetch jobs automatically
+    if state.get("phase") == "ready" and state.get("role_keywords") and state.get("location"):
+        role = state["role_keywords"]
+        location = state["location"]
+        income_type = state.get("income_type") or "job"
 
-    # --- 5️⃣ Ready phase
-    if state.get("role_keywords") and state.get("location"):
-        state["phase"] = "ready"
-        state["readiness"] = True
+        jobs = await fetch_jobs(role, location, income_type)
+        state.update({
+            "jobs_shown": True,
+            "phase": "results",
+            "cached_jobs": jobs
+        })
 
-    print(f"[DEBUG] extract_signals final: {state}")
+        assistant_text = (
+            f"Here are some {income_type} options for a '{role}' in {location}."
+            if jobs else
+            f"Sorry, I couldn't find any {income_type} jobs for a '{role}' in {location}."
+        )
+
+        return {
+            "assistantText": assistant_text,
+            "mode": "results" if jobs else "no_results",
+            "jobs": jobs,
+            "debug": {"role": role, "location": location, "query_count": len(jobs)}
+        }
+
+    # --- 8️⃣ Fallback: let AI respond naturally
+    reply = await generate_coached_reply(state, conversation_history, user_message)
+    if not reply or reply.strip() == "":
+        reply = "Hello! I can help you find jobs or gigs. What role are you interested in?"
+
+    return {
+        "assistantText": reply.strip(),
+        "mode": "chat",
+        "jobs": [],
+        "debug": {"role": state.get("role_keywords"), "location": state.get("location")}
+    }
 
 # -------------------------------------------------------------------
 # Discovery question
