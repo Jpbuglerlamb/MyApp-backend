@@ -392,9 +392,10 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             return {"assistantText": question, "mode": "chat", "jobs": [], "debug": {"role": state.get("role_keywords"), "location": state.get("location")}}
         state["phase"] = "ready"
 
-    # Ready phase: fetch jobs with broadening
+    # Ready phase: fetch jobs internally using broader variants
     if state.get("phase") == "ready" and state.get("role_keywords") and state.get("location"):
-        variants = await broaden_role_with_ai(state["role_keywords"], state["location"])
+        user_role = state["role_keywords"]  # keep original for frontend
+        variants = await broaden_role_with_ai(user_role, state["location"])  # broaden only for search
         variants = [v.strip() for v in variants if v.strip()]
         all_jobs = []
         for v in variants:
@@ -407,10 +408,19 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
 
         state.update({"jobs_shown": True, "phase": "results", "cached_jobs": all_jobs})
 
-        assistant_text = f"Here are some {state.get('income_type','job')} options for '{state['role_keywords']}' in {state['location']}." if all_jobs else f"Sorry, I couldn't find any {state.get('income_type','job')} jobs for '{state['role_keywords']}' in {state['location']}."
+        assistant_text = f"Here are some {state.get('income_type','job')} options for '{user_role}' in {state['location']}." if all_jobs else f"Sorry, I couldn't find any {state.get('income_type','job')} jobs for '{user_role}' in {state['location']}."
         mode = "results" if all_jobs else "no_results"
 
-        return {"assistantText": assistant_text, "mode": mode, "jobs": all_jobs, "debug": {"role": state["role_keywords"], "location": state["location"], "query_count": len(all_jobs)}}
+        return {
+            "assistantText": assistant_text,
+            "mode": mode,
+            "jobs": all_jobs,
+            "debug": {
+                "role": user_role,  # display user role
+                "location": state["location"],
+                "query_count": len(all_jobs)
+            }
+        }
 
     # Fallback
     reply = await generate_coached_reply(state, conversation_history, user_message)
