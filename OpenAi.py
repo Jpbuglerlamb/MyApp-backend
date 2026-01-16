@@ -171,9 +171,9 @@ async def extract_signals(message: str, state: dict) -> None:
             cleaned_role = await normalize_role_with_ai(ai_role_clean)
             state["role_keywords"] = map_role_synonym(cleaned_role)
         else:
-            state["role_keywords"] = map_role_synonym(ai_role)  # fallback without GPT
+            state["role_keywords"] = map_role_synonym(ai_role)
 
-    # --- 5️⃣ Regex fallback (original pattern)
+    # --- 5️⃣ Regex fallback (original patterns)
     role_match = re.search(
         r"(?:work as|job as|be a|be an|looking for|i am a|i am an|part[- ]?time job as|full[- ]?time job as)\s+(.+?)" + _STOP,
         low, re.I
@@ -186,9 +186,12 @@ async def extract_signals(message: str, state: dict) -> None:
         if standardized_role.lower() not in BAD_ROLE_KEYWORDS:
             state["role_keywords"] = standardized_role
 
-    # --- 6️⃣ Extra regex fallback for "I want / I need / I am looking for ..."
+    # --- 6️⃣ Regex fallback for "I want / I need / I'm looking for ..."
     if not state.get("role_keywords"):
-        fallback_match = re.search(r"i (?:want|am looking for|need) (.+?) (?:job|role|position)?", low, re.I)
+        fallback_match = re.search(
+            r"i(?:'m| am)? (?:looking for|want|need) (.+?) (?:job|role|position)?",
+            low, re.I
+        )
         if fallback_match:
             fallback_role = normalize_role_for_api(fallback_match.group(1))
             if fallback_role and len(fallback_role) > 2:
@@ -197,7 +200,11 @@ async def extract_signals(message: str, state: dict) -> None:
             if standardized_role.lower() not in BAD_ROLE_KEYWORDS:
                 state["role_keywords"] = standardized_role
 
-    # --- 7️⃣ Location extraction
+    # --- 7️⃣ Final fallback: map entire cleaned message if still None
+    if not state.get("role_keywords"):
+        state["role_keywords"] = map_role_synonym(_strip_fillers(message))
+
+    # --- 8️⃣ Location extraction
     loc = None
     if ai_location:
         loc = ai_location.strip().title()
@@ -209,11 +216,11 @@ async def extract_signals(message: str, state: dict) -> None:
         matches = difflib.get_close_matches(loc, UK_CITIES, n=1, cutoff=0.7)
         state["location"] = matches[0] if matches else loc
 
-    # --- 8️⃣ Sanity check: remove junk roles
+    # --- 9️⃣ Sanity check: remove junk roles
     if (state.get("role_keywords") or "").lower() in BAD_ROLE_KEYWORDS:
         state["role_keywords"] = None
 
-    # --- 9️⃣ Ready phase
+    # --- 🔟 Ready phase
     if state.get("role_keywords") and state.get("location"):
         state["phase"] = "ready"
         state["readiness"] = True
