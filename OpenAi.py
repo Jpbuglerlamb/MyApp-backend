@@ -394,25 +394,31 @@ Search Trigger Rules
         return "Sorry, I had trouble processing that. Can you tell me about the role or location you're interested in?"
 
 # -------------------------------
-# Main chat entry (human-friendly, adaptive)
+# Main chat entry (user-aware, human-friendly)
 # -------------------------------
-async def chat_with_user(*, user_id: str, user_message: str, conversation_history: list) -> dict:
-    state = get_state(user_id)
+async def chat_with_user(*, session_id: str, user_message: str) -> dict:
+    """
+    Chat with AI Aura using a logged-in user's session.
+    Maintains state, memory, and job history per user.
+    """
+    # -------------------------------------------------------------------
+    # 1. Access user state and memory
+    # -------------------------------------------------------------------
+    state = get_user_state(session_id)
+    memory = get_user_memory(session_id)
     low = (user_message or "").lower().strip()
 
-    # -----------------------------------
-    # 1. Greetings / reset
-    # -----------------------------------
+    # Save user message to memory
+    append_user_memory(session_id, "user", user_message)
+
+    # -------------------------------------------------------------------
+    # 2. Greetings / reset
+    # -------------------------------------------------------------------
     if low in {"hi", "hello", "hey", "hiya"}:
-        state.clear()
-        state.update({
-            "phase": "discovery",
-            "jobs_shown": False,
-            "cached_jobs": [],
-            "last_question": None,
-            "asked_income_type": False,
-            "last_small_talk": None
-        })
+        clear_user_state(session_id)
+        clear_user_memory(session_id)
+        state = get_user_state(session_id)  # reset state
+
         return {
             "assistantText": "Hello! I'm here to help you find jobs or gigs. What role are you interested in?",
             "mode": "chat",
@@ -420,74 +426,61 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             "debug": {}
         }
 
-    # -----------------------------------
-    # 2. Detect new search intent
-    # -----------------------------------
+    # -------------------------------------------------------------------
+    # 3. Detect new search intent
+    # -------------------------------------------------------------------
     if NEW_SEARCH_RE.search(low):
         state.update({
             "jobs_shown": False,
             "phase": "discovery",
-            "cached_jobs": [],
             "last_question": None,
             "asked_income_type": False
         })
 
-    # -----------------------------------
-    # 3. Extract signals (role, location, income, salary)
-    # -----------------------------------
+    # -------------------------------------------------------------------
+    # 4. Extract signals (role, location, income, salary)
+    # -------------------------------------------------------------------
     await extract_signals(user_message, state)
 
-    # -----------------------------------
-    # 3a. Detect mid-chat changes
-    # -----------------------------------
-    previous_role = state.get("role_keywords")
-    previous_location = state.get("location")
+    # -------------------------------------------------------------------
+    # 5. Handle explicit income-type mentions
+    # -------------------------------------------------------------------
     previous_income = state.get("income_type", "job")
-
-    if state.get("role_keywords") and state["role_keywords"] != previous_role:
-        state["phase"] = "ready"
-        state["jobs_shown"] = False
-
-    if state.get("location") and state["location"] != previous_location:
-        state["phase"] = "ready"
-        state["jobs_shown"] = False
-
-    if ("part" in low and previous_income != "part-time") or ("full" in low and previous_income != "full-time"):
-        state["income_type"] = "part-time" if "part" in low else "full-time"
-        state["phase"] = "ready"
-        state["jobs_shown"] = False
-
-    # -----------------------------------
-    # 4. Handle explicit income-type mentions
-    # -----------------------------------
-    if "part" in low:
+    if "part" in low and previous_income != "part-time":
         state["income_type"] = "part-time"
-    elif "full" in low:
+        state["phase"] = "ready"
+        state["jobs_shown"] = False
+    elif "full" in low and previous_income != "full-time":
         state["income_type"] = "full-time"
+        state["phase"] = "ready"
+        state["jobs_shown"] = False
 
-    # -----------------------------------
-    # 5. Discovery phase: ask minimal clarifying questions
-    # -----------------------------------
+    # -------------------------------------------------------------------
+    # 6. Discovery phase: ask minimal clarifying questions
+    # -------------------------------------------------------------------
     if state.get("phase") == "discovery":
         question = next_discovery_question(state)
         if question:
             state["last_question"] = question
+            append_user_memory(session_id, "assistant", question)
             return {
                 "assistantText": question,
                 "mode": "chat",
                 "jobs": [],
                 "debug": {"role": state.get("role_keywords"), "location": state.get("location")}
             }
+        # Nothing left to ask → move to ready
         state["phase"] = "ready"
 
-    # -----------------------------------
-    # 6. Prompt for income-type if unknown
-    # -----------------------------------
-    income_type = state.get("income_type", "job")
-    if income_type == "job" and not state.get("asked_income_type"):
+    # -------------------------------------------------------------------
+    # 7. Prompt for income-type if unknown
+    # -------------------------------------------------------------------
+    if state.get("income_type", "job") == "job" and not state.get("asked_income_type"):
         state["asked_income_type"] = True
+        question = f"I've found some '{state['role_keywords']}' jobs in {state['location']}. Do you want full-time or part-time work?"
+        append_user_memory(session_id, "assistant", question)
         return {
-            "assistantText": f"I've found some '{state['role_keywords']}' jobs in {state['location']}. Do you want full-time or part-time work?",
+            "assistantText": question,
             "mode": "chat",
             "jobs": [],
             "debug": {"role": state.get("role_keywords"), "location": state.get("location")}
@@ -499,11 +492,11 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             state["income_type"] = "part-time"
         elif "full" in low:
             state["income_type"] = "full-time"
-        state["asked_income_type"] = False  # reset after handling
+        state["asked_income_type"] = False  # reset
 
-    # -----------------------------------
-    # 7. Ready phase: fetch jobs if role & location known
-    # -----------------------------------
+    # -------------------------------------------------------------------
+    # 8. Ready phase: fetch jobs if role & location known
+    # -------------------------------------------------------------------
     if state.get("phase") == "ready" and state.get("role_keywords") and state.get("location") and not state.get("jobs_shown"):
         user_role = state["role_keywords"]
 
@@ -522,14 +515,15 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
         unique_jobs = {(job['title'], job['company'], job['location']): job for job in all_jobs}
         all_jobs = list(unique_jobs.values())
 
+        # Save jobs to user's cached state and history
         state.update({"jobs_shown": True, "phase": "results", "cached_jobs": all_jobs})
+        for job in all_jobs:
+            save_user_job(session_id, job)
 
-        # Compose human-friendly, coaching-style response
+        # Compose human-friendly response
         income_type = state.get("income_type", "job")
         num_jobs = len(all_jobs)
-
         if num_jobs > 0:
-            # Suggest gig vs traditional job based on role
             if user_role.lower() in ["cleaner", "bar staff", "server", "driver", "delivery driver"]:
                 role_type = "These could be flexible gigs or part-time roles depending on your preference."
             else:
@@ -542,14 +536,12 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             )
             mode = "results"
         else:
-            # No jobs found → suggest alternatives
             suggestions = []
             if income_type != "part-time":
                 suggestions.append("try part-time roles")
-            if state["location"] not in ["London", "Edinburgh", "Manchester"]:  # simple nearby suggestion
+            if state["location"] not in ["London", "Edinburgh", "Manchester"]:
                 suggestions.append("check nearby cities")
             suggestions.append("consider similar roles")
-
             suggestion_text = ", or ".join(suggestions)
             assistant_text = (
                 f"Sorry, I couldn't find any {income_type} jobs for '{user_role}' in {state['location']}. "
@@ -557,6 +549,7 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             )
             mode = "no_results"
 
+        append_user_memory(session_id, "assistant", assistant_text)
         return {
             "assistantText": assistant_text,
             "mode": mode,
@@ -564,21 +557,19 @@ async def chat_with_user(*, user_id: str, user_message: str, conversation_histor
             "debug": {"role": user_role, "location": state["location"], "query_count": num_jobs}
         }
 
-    # -----------------------------------
-    # 8. Fallback: natural response for chit-chat / gratitude
-    # -----------------------------------
+    # -------------------------------------------------------------------
+    # 9. Fallback: chit-chat / AI-guided response
+    # -------------------------------------------------------------------
     if any(x in low for x in ["thanks", "thank you", "ok", "okay", "cool", "great"]):
         state["last_small_talk"] = user_message
-        return {
-            "assistantText": "You’re welcome! Let me know if you want to search for more jobs or gigs.",
-            "mode": "chat",
-            "jobs": [],
-            "debug": {}
-        }
+        reply = "You’re welcome! Let me know if you want to search for more jobs or gigs."
+        append_user_memory(session_id, "assistant", reply)
+        return {"assistantText": reply, "mode": "chat", "jobs": [], "debug": {}}
 
     # Otherwise, generate AI-guided career response
-    reply = await generate_coached_reply(state, conversation_history, user_message)
+    reply = await generate_coached_reply(state, memory, user_message)
     if not reply.strip():
         reply = "Hello! I can help you find jobs or gigs. What role are you interested in?"
+    append_user_memory(session_id, "assistant", reply)
 
     return {"assistantText": reply.strip(), "mode": "chat", "jobs": [], "debug": {"role": state.get("role_keywords"), "location": state.get("location")}}

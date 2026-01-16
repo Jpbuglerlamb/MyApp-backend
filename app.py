@@ -2,10 +2,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
+import uuid
 import traceback
 
+from memory_store import (
+    get_memory, append_message, clear_memory,
+    get_state, clear_state
+)
 from OpenAi import chat_with_user
-from memory_store import get_memory, append_message, clear_memory, clear_state
 
 # -------------------------------------------------------------------
 # App setup
@@ -41,6 +45,19 @@ class ChatResponse(BaseModel):
     jobs: List[JobSuggestion]
     debug: dict = {}  # optional, for dev
 
+class UserCredentials(BaseModel):
+    username: str
+    password: str  # plaintext for now, but you should hash for production
+
+class AuthResponse(BaseModel):
+    sessionId: str
+    message: str
+
+# -------------------------------------------------------------------
+# In-memory user store (for demo)
+# -------------------------------------------------------------------
+USER_STORE = {}  # username -> {"password": str, "session_id": str}
+
 # -------------------------------------------------------------------
 # Health check
 # -------------------------------------------------------------------
@@ -48,6 +65,39 @@ class ChatResponse(BaseModel):
 @app.get("/", summary="Health check endpoint")
 async def health_check():
     return {"status": "ok"}
+
+# -------------------------------------------------------------------
+# Sign-up
+# -------------------------------------------------------------------
+
+@app.post("/signup", response_model=AuthResponse, summary="Create a new account")
+async def signup(credentials: UserCredentials):
+    username = credentials.username.lower()
+    if username in USER_STORE:
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    session_id = str(uuid.uuid4())
+    USER_STORE[username] = {"password": credentials.password, "session_id": session_id}
+
+    # Initialize memory/state for new user
+    clear_memory(session_id)
+    clear_state(session_id)
+
+    return AuthResponse(sessionId=session_id, message="Sign-up successful")
+
+# -------------------------------------------------------------------
+# Login
+# -------------------------------------------------------------------
+
+@app.post("/login", response_model=AuthResponse, summary="Login existing user")
+async def login(credentials: UserCredentials):
+    username = credentials.username.lower()
+    user = USER_STORE.get(username)
+    if not user or user["password"] != credentials.password:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    session_id = user["session_id"]
+    return AuthResponse(sessionId=session_id, message="Login successful")
 
 # -------------------------------------------------------------------
 # Chat endpoint
@@ -81,9 +131,8 @@ async def chat(request: ChatRequest):
     # 3️⃣ Call AI Aura backend logic
     try:
         response = await chat_with_user(
-            user_id=session_id,
-            user_message=user_message,
-            conversation_history=conversation_history  # <-- corrected param name
+            session_id=session_id,
+            user_message=user_message
         )
     except Exception as e:
         tb = traceback.format_exc()
