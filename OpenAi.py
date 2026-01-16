@@ -3,7 +3,7 @@ import json
 import os
 import re
 from typing import List, Dict, Any, Optional
-
+import difflib
 import httpx
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -29,7 +29,28 @@ _STOP = r"(?:\s+(?:in|near|based in|based)\b|[.,;!?]|$)"
 BAD_ROLE_KEYWORDS = {"a job", "job", "jobs", "work", "position", "role", "career", "employment"}
 NEW_SEARCH_RE = re.compile(r"\b(find|search|look for|can you find|what about)\b", re.I)
 DYNAMIC_KEYWORDS = ["jobs", "gigs", "role", "industry", "location", "salary", "qualifications", "experience", "knowledge"]
-
+ROLE_SYNONYMS = {
+    # Tech / IT
+    "app development": "Software Developer",
+    "software engineer": "Software Developer",
+    "web developer": "Software Developer",
+    "frontend": "Frontend Developer",
+    "backend": "Backend Developer",
+    "ux": "UX Designer",
+    "ui": "UI Designer",
+    "data analyst": "Data Analyst",
+    "data scientist": "Data Scientist",
+    "mobile developer": "Mobile Developer",
+    # Hospitality
+    "waiter": "Server",
+    "bar staff": "Server",
+    "chef": "Chef",
+    "cook": "Chef",
+    # General / flexible
+    "teacher": "Teacher",
+    "driver": "Driver",
+    "delivery driver": "Driver",
+}
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
@@ -48,6 +69,40 @@ def normalize_role_for_api(role: str) -> str:
         role = role.replace(f,"")
     return role.strip()
 
+def map_role_synonym(role: str, cutoff: float = 0.7) -> str:
+    """
+    Map a user-entered role to a standard title using ROLE_SYNONYMS.
+    Uses fuzzy matching for typos and partial matches.
+    
+    Args:
+        role: The cleaned role from the user / AI
+        cutoff: minimum similarity (0.0-1.0) to accept a match
+    """
+    if not role:
+        return ""
+
+    lowered = role.lower()
+
+    # Exact substring match first
+    for key, standard in ROLE_SYNONYMS.items():
+        if key in lowered:
+            return standard
+
+    # Fuzzy match
+    best_match = None
+    highest_ratio = 0.0
+    for key, standard in ROLE_SYNONYMS.items():
+        ratio = difflib.SequenceMatcher(None, lowered, key).ratio()
+        if ratio > highest_ratio and ratio >= cutoff:
+            best_match = standard
+            highest_ratio = ratio
+
+    if best_match:
+        return best_match
+
+    # Fallback: capitalize words
+    return role.title()
+
 STANDARD_INCOME_TYPES = {
     "full-time": ["full time", "full-time", "permanent"],
     "part-time": ["part time", "part-time", "casual", "zero hour"],
@@ -65,17 +120,39 @@ def normalize_income_type(user_text: str) -> str:
     return "job"
 
 async def normalize_role_with_ai(role: str) -> str:
-    if not role: return ""
-    prompt = f"Correct typos and clean up this job role for a job search: '{role}'. Return only the corrected title."
+    if not role:
+        return ""
+
+    # --- Step 1: AI cleanup prompt
+    prompt = (
+        "Clean and normalize this job role for a job search. "
+        "Remove words like 'job', 'jobs', 'position', or 'role'. "
+        "Do not include quotes. Return only the job title.\n\n"
+        f"Text: {role}"
+    )
+
     try:
         response = await client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.0
         )
-        return response.choices[0].message.content.strip()
+        cleaned = response.choices[0].message.content.strip()
     except Exception:
-        return role.strip()
+        cleaned = role.strip()
+
+    # --- Step 2: Remove wrapping quotes & trailing 'job'
+    cleaned = cleaned.strip("\"'")
+    cleaned = re.sub(r"\bjobs?\b", "", cleaned, flags=re.I).strip()
+
+    # --- Step 3: Map synonyms
+    lowered = cleaned.lower()
+    for key, standard in ROLE_SYNONYMS.items():
+        if key in lowered:
+            return standard  # return standardized role
+
+    # --- Step 4: fallback: capitalize words
+    return cleaned.title()
 
 async def extract_dynamic_keywords(user_message: str) -> Dict[str,str]:
     prompt = f"Extract keywords from this text: {DYNAMIC_KEYWORDS}. Text: {user_message}"
@@ -121,7 +198,8 @@ async def extract_signals(message: str, state: dict) -> None:
     # --- Tentatively set AI outputs
     if ai_role:
         cleaned_role = await normalize_role_with_ai(ai_role)
-        state["role_keywords"] = cleaned_role
+        standardized_role = map_role_synonym(cleaned_role)  # fuzzy mapping
+        state["role_keywords"] = standardized_role
     if ai_location:
         state["location"] = ai_location.title()
 
@@ -133,9 +211,9 @@ async def extract_signals(message: str, state: dict) -> None:
     if role_match:
         fallback_role = normalize_role_for_api(role_match.group(1))
         fallback_role = await normalize_role_with_ai(fallback_role)
-        # Overwrite only if AI result is junk or missing
-        if fallback_role.lower() not in BAD_ROLE_KEYWORDS and fallback_role.lower() != (state.get("role_keywords") or "").lower():
-            state["role_keywords"] = fallback_role
+        standardized_role = map_role_synonym(fallback_role)  # fuzzy mapping
+        if standardized_role.lower() not in BAD_ROLE_KEYWORDS and standardized_role.lower() != (state.get("role_keywords") or "").lower():
+            state["role_keywords"] = standardized_role
 
     # --- Location fallback
     if not state.get("location"):
