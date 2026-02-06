@@ -62,6 +62,7 @@ def _friendly_error_message(error_code: str) -> str:
 def _welcome_message() -> str:
     return (
         "Welcome to Axis"
+        
         "The Job Finding AI"
     )
 
