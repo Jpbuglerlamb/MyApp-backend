@@ -9,7 +9,11 @@ from pydantic import BaseModel
 
 from ai.extraction import extract_signals, NEW_SEARCH_RE, normalize_role_with_api
 from ai.generation import generate_coached_reply
-from ai.role_resolver import resolve_role_from_dataset, build_search_keywords, strip_time_modifiers
+from ai.role_resolver import (
+    resolve_role_from_dataset,
+    build_search_keywords,
+    strip_time_modifiers,
+)
 from jobs.adzuna import fetch_jobs
 from jobs.job_cards import to_job_cards
 from memory.store import (
@@ -22,6 +26,7 @@ from memory.store import (
     clear_user_jobs,
 )
 from core.state_machine import next_discovery_question
+
 
 WELCOME_TEXT = (
     "Hey 👋 Tell me the role and location you’re looking for "
@@ -102,6 +107,10 @@ def _job_id(job: dict) -> str:
 # State helpers
 # -------------------------------------------------------------------
 def _strip_role_fields_in_state(state: Dict[str, Any]) -> None:
+    """
+    Strip time/contract modifiers ONLY from canonical-ish role fields.
+    Do NOT touch display fields.
+    """
     for k in ("role_raw", "resolved_role", "role_canon"):
         v = state.get(k)
         if isinstance(v, str) and v.strip():
@@ -109,7 +118,16 @@ def _strip_role_fields_in_state(state: Dict[str, Any]) -> None:
 
 
 def _reset_search_state(state: Dict[str, Any], *, keep_location: bool = True) -> None:
+    """
+    Resets ONLY job-search related fields so pivots can restart cleanly.
+    Keeps location by default so "actually software engineering" keeps the city.
+    """
     loc = state.get("location") if keep_location else None
+    # Preserve reflective/clarity keys so they don't get nuked by search resets
+    clarity_offer = state.get("phase") == "clarity_offer"
+    clarity_level = state.get("phase") == "clarity_level"
+    reflective_step = state.get("reflective_step")
+
     state.update(
         {
             "phase": "discovery",
@@ -117,16 +135,24 @@ def _reset_search_state(state: Dict[str, Any], *, keep_location: bool = True) ->
             "asked_income_type": False,
             "income_type": None,
             "current_deck": None,
-            "cached_jobs": [],
+            "cached_jobs": [],  # JobCards
             "resolved_role": None,
             "role_raw": None,
-            "role_keywords": None,
+            "role_keywords": None,  # legacy display fallback
             "role_display": None,
             "role_canon": None,
             "role_query": None,
             "location": loc,
         }
     )
+
+    # Restore reflective controls if we were in them
+    if clarity_offer:
+        state["phase"] = "clarity_offer"
+    if clarity_level:
+        state["phase"] = "clarity_level"
+    if reflective_step is not None:
+        state["reflective_step"] = reflective_step
 
 
 def _get_or_create_session(user_id: str, now: datetime) -> Tuple[List[ChatSession], ChatSession]:
@@ -146,10 +172,17 @@ def _get_or_create_session(user_id: str, now: datetime) -> Tuple[List[ChatSessio
 
 
 def _role_logic(state: Dict[str, Any]) -> str:
+    """
+    Use role_canon for logic; fall back to role_raw.
+    Never use role_keywords here (display field).
+    """
     return (state.get("role_canon") or state.get("role_raw") or "").strip().lower()
 
 
 def _role_display(state: Dict[str, Any]) -> str:
+    """
+    Use role_display for UI text; fall back to role_keywords.
+    """
     return (state.get("role_display") or state.get("role_keywords") or "").strip()
 
 
@@ -160,7 +193,8 @@ PIVOT_RE = re.compile(r"\b(actually|instead|change|different|switch|new\s+role|n
 ACK_ONLY_RE = re.compile(r"^\s*(thanks|thank you|ok|okay|cool|great)\s*[.!?]?\s*$", re.I)
 RESET_RE = re.compile(r"\b(reset|start over|new search|clear everything)\b", re.I)
 
-REFLECTIVE_RE = re.compile(r"\b(confused|lost|unsure|not sure|don't know|future|career|stuck)\b", re.I)
+# Reflective intent (career confusion / uncertainty)
+REFLECTIVE_RE = re.compile(r"\b(confused|lost|unsure|not sure|don'?t know|future|career|stuck)\b", re.I)
 
 
 def _is_greeting(low: str) -> bool:
@@ -177,6 +211,40 @@ def _is_new_search_intent(low: str) -> bool:
 
 def _is_reflective(low: str) -> bool:
     return bool(REFLECTIVE_RE.search(low))
+
+
+def _is_yes(low: str) -> bool:
+    return low in {"yes", "y", "yeah", "yep", "sure", "ok", "okay"}
+
+
+def _is_no(low: str) -> bool:
+    return low in {"no", "n", "nah", "nope"}
+
+
+# -------------------------------------------------------------------
+# Reflective / clarity micro-flow
+# -------------------------------------------------------------------
+CLARITY_QUESTIONS = [
+    "What have you been doing recently (work or studies)?",
+    "What are you naturally good at, even if you don’t feel ‘sorted’ yet?",
+    "Do you prefer: people-facing, hands-on practical, or desk/technical work?",
+    "What matters most right now: money, stability, flexibility, or growth?",
+]
+
+
+def _next_clarity_question(state: Dict[str, Any]) -> Optional[str]:
+    idx = int(state.get("clarity_step", 0) or 0)
+    if idx >= len(CLARITY_QUESTIONS):
+        return None
+    state["clarity_step"] = idx + 1
+    return CLARITY_QUESTIONS[idx]
+
+
+def _start_clarity_offer(state: Dict[str, Any]) -> None:
+    state["phase"] = "clarity_offer"
+    # reset clarity progression each time they enter it
+    state["clarity_step"] = 0
+    state.pop("clarity_level", None)
 
 
 # -------------------------------------------------------------------
@@ -266,30 +334,30 @@ async def chat_with_user(
             debug={"intent": "ack"},
         )
 
-    # 4) Adaptive “career confusion” routing (state-aware)
-    #    IMPORTANT: do this before extract_signals so we don’t force job parsing on reflective input.
+    # ---------------------------------------------------------------
+    # 4) Reflective routing: do this BEFORE extract_signals.
+    # ---------------------------------------------------------------
     already_have_role = bool(_role_logic(state))
     already_have_loc = bool((state.get("location") or "").strip())
 
-    # Handle responses to clarity offer
+    # If we’re already in the clarity flow, keep it coherent
     if state.get("phase") == "clarity_offer":
-        if low in {"yes", "yeah", "yep", "clarity_yes"}:
-            state["phase"] = "clarity_level"
+        if low in {"clarity_yes"} or _is_yes(low):
+            state["phase"] = "clarity_chat"
+            q = _next_clarity_question(state) or "Tell me a bit about your experience."
             return _remember_and_return(
                 user_id=user_id,
                 sessions=sessions,
                 session=session,
                 now=now,
-                text=(
-                    "Cool. Quick one.\n"
-                    "What’s your experience level?\n"
-                    "1) Student  2) Entry  3) 1–3 yrs  4) 3–7 yrs  5) 7+ yrs"
-                ),
+                text=f"Cool. {q}",
+                mode="reflective",
                 actions=[],
                 links=[],
-                debug={"intent": "clarity_level"},
+                debug={"intent": "clarity_start"},
             )
-        if low in {"no", "nah", "nope", "clarity_no"}:
+
+        if low in {"clarity_no"} or _is_no(low):
             state["phase"] = "discovery"
             return _remember_and_return(
                 user_id=user_id,
@@ -302,7 +370,6 @@ async def chat_with_user(
                 debug={"intent": "clarity_declined"},
             )
 
-        # If they typed something else, gently re-ask
         return _remember_and_return(
             user_id=user_id,
             sessions=sessions,
@@ -314,31 +381,24 @@ async def chat_with_user(
             debug={"intent": "clarity_offer_repeat"},
         )
 
-    # Minimal clarity flow (V1): capture experience level then move back to practical search
-    if state.get("phase") == "clarity_level":
-        # Accept 1-5 or words
-        if any(x in low for x in {"1", "student"}):
-            state["clarity_level"] = "student"
-        elif any(x in low for x in {"2", "entry"}):
-            state["clarity_level"] = "entry"
-        elif any(x in low for x in {"3", "1–3", "1-3"}):
-            state["clarity_level"] = "1-3"
-        elif any(x in low for x in {"4", "3–7", "3-7"}):
-            state["clarity_level"] = "3-7"
-        elif any(x in low for x in {"5", "7+"}):
-            state["clarity_level"] = "7+"
-        else:
+    if state.get("phase") == "clarity_chat":
+        # We store the user's answer implicitly in memory already.
+        # Ask next question or transition back to practical search.
+        q = _next_clarity_question(state)
+        if q:
             return _remember_and_return(
                 user_id=user_id,
                 sessions=sessions,
                 session=session,
                 now=now,
-                text="Pick one number: 1) Student  2) Entry  3) 1–3 yrs  4) 3–7 yrs  5) 7+ yrs",
+                text=q,
+                mode="reflective",
                 actions=[],
                 links=[],
-                debug={"intent": "clarity_level_reprompt"},
+                debug={"intent": "clarity_next"},
             )
 
+        # Done with clarity: return to search prompt
         state["phase"] = "discovery"
         return _remember_and_return(
             user_id=user_id,
@@ -346,56 +406,36 @@ async def chat_with_user(
             session=session,
             now=now,
             text=(
-                "Nice. Now tell me either:\n"
-                "• a role + location to search (example: waiter in Edinburgh)\n"
-                "or\n"
-                "• two roles + your city (example: barista vs receptionist, Edinburgh)."
+                "Nice. If you want, we can now turn that into real job options.\n"
+                "Tell me either:\n"
+                "• a role + location (e.g. “waiter in Edinburgh”), or\n"
+                "• 2–3 roles you’re considering + your city."
             ),
             actions=[],
             links=[],
-            debug={"intent": "clarity_to_search", "clarity_level": state.get("clarity_level")},
+            debug={"intent": "clarity_done"},
         )
 
-    # If the new message is reflective, route based on what we already know
+    # Reflective input: route intelligently
     if _is_reflective(low):
-        if already_have_role and already_have_loc:
+        # If we already have search context, offer a choice (don’t derail)
+        if already_have_role or already_have_loc:
             return _remember_and_return(
                 user_id=user_id,
                 sessions=sessions,
                 session=session,
                 now=now,
-                text="Got you. Want to keep it practical and continue the search, or change role/location?",
-                actions=[{"type": "YES_NO", "yesValue": "continue_search", "noValue": "change_search"}],
+                text=(
+                    "Got you. Want to keep it practical and continue the search, "
+                    "or do a quick clarity chat first?"
+                ),
+                actions=[{"type": "YES_NO", "yesValue": "continue_search", "noValue": "clarity_yes"}],
                 links=[],
                 debug={"intent": "reflective_with_context"},
             )
 
-        if already_have_role and not already_have_loc:
-            return _remember_and_return(
-                user_id=user_id,
-                sessions=sessions,
-                session=session,
-                now=now,
-                text="Got you. Which city should I search in?",
-                actions=[],
-                links=[],
-                debug={"intent": "reflective_missing_location"},
-            )
-
-        if already_have_loc and not already_have_role:
-            return _remember_and_return(
-                user_id=user_id,
-                sessions=sessions,
-                session=session,
-                now=now,
-                text="Got you. What kind of role should I search for?",
-                actions=[],
-                links=[],
-                debug={"intent": "reflective_missing_role"},
-            )
-
-        # Nothing known: offer clarity pass (YES/NO)
-        state["phase"] = "clarity_offer"
+        # No context: offer clarity pass (YES/NO)
+        _start_clarity_offer(state)
         return _remember_and_return(
             user_id=user_id,
             sessions=sessions,
@@ -410,8 +450,9 @@ async def chat_with_user(
             debug={"intent": "clarity_offer"},
         )
 
-    # Handle yes/no from reflective-with-context path
-    if low in {"continue_search"}:
+    # Handle the YES/NO choice from reflective-with-context
+    if low == "continue_search":
+        # Don’t nuke state, just prompt
         return _remember_and_return(
             user_id=user_id,
             sessions=sessions,
@@ -423,20 +464,9 @@ async def chat_with_user(
             debug={"intent": "continue_search"},
         )
 
-    if low in {"change_search"}:
-        _reset_search_state(state, keep_location=False)
-        return _remember_and_return(
-            user_id=user_id,
-            sessions=sessions,
-            session=session,
-            now=now,
-            text="No problem. What role and location do you want instead?",
-            actions=[],
-            links=[],
-            debug={"intent": "change_search"},
-        )
-
-    # 5) New search intent early (your existing pivot rule)
+    # ---------------------------------------------------------------
+    # 5) New search intent early (pivot)
+    # ---------------------------------------------------------------
     if _is_new_search_intent(low):
         _reset_search_state(state, keep_location=True)
 
@@ -480,7 +510,9 @@ async def chat_with_user(
         if low in {"yes", "yeah", "yep", "talk_yes"}:
             state["phase"] = "discuss_likes"
             text = "Cool. What matters most to you: pay, flexibility, location, or growth?"
-            return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text=text)
+            return _remember_and_return(
+                user_id=user_id, sessions=sessions, session=session, now=now, text=text, actions=[], links=[]
+            )
 
         if low in {"no", "n", "nah", "nope", "talk_no"}:
             links = [
@@ -490,7 +522,9 @@ async def chat_with_user(
             ]
             state["phase"] = "ready"
             text = "All good. Here are the direct links to the ones you liked:"
-            return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text=text, links=links)
+            return _remember_and_return(
+                user_id=user_id, sessions=sessions, session=session, now=now, text=text, actions=[], links=links
+            )
 
         text = "Quick one: do you want to talk about the jobs you liked? Yes or no."
         return _remember_and_return(
@@ -501,13 +535,22 @@ async def chat_with_user(
             text=text,
             mode="post_swipe",
             actions=[{"type": "YES_NO", "yesValue": "talk_yes", "noValue": "talk_no"}],
+            links=[],
         )
 
     # 8) Discovery (ONLY if not ready)
     if state.get("phase") == "discovery" and not state.get("readiness"):
         q = next_discovery_question(state)
         if q:
-            return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text=q)
+            return _remember_and_return(
+                user_id=user_id,
+                sessions=sessions,
+                session=session,
+                now=now,
+                text=q,
+                actions=[],
+                links=[],
+            )
 
     # 9) Income type clarification (only when we have role + location)
     if state.get("income_type") is None and not state.get("asked_income_type"):
@@ -515,7 +558,9 @@ async def chat_with_user(
             state["asked_income_type"] = True
             role_text = _role_display(state) or "that role"
             text = f"Do you want full-time or part-time {role_text} work in {state['location']}?"
-            return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text=text)
+            return _remember_and_return(
+                user_id=user_id, sessions=sessions, session=session, now=now, text=text, actions=[], links=[]
+            )
 
     if state.get("asked_income_type"):
         if "part" in low:
@@ -525,7 +570,10 @@ async def chat_with_user(
             state["income_type"] = "full-time"
             state["jobs_shown"] = False
         else:
-            return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text="Full-time or part-time?")
+            text = "Full-time or part-time?"
+            return _remember_and_return(
+                user_id=user_id, sessions=sessions, session=session, now=now, text=text, actions=[], links=[]
+            )
         state["asked_income_type"] = False
 
     # 10) Fetch jobs -> cards -> deck
@@ -535,11 +583,17 @@ async def chat_with_user(
         state["resolved_role"] = resolved_role
         state["role_query"] = search_keywords
 
-        jobs = await fetch_jobs(role_keywords=search_keywords, location=state["location"], income_type=income_type)
+        jobs = await fetch_jobs(
+            role_keywords=search_keywords,
+            location=state["location"],
+            income_type=income_type,
+        )
 
+        # Deduplicate raw results
         uniq = {(j.get("title", ""), j.get("company", ""), j.get("location", "")): j for j in (jobs or [])}
         jobs = list(uniq.values())
 
+        # Stable IDs
         for j in jobs:
             j["id"] = _job_id(j)
 
@@ -557,9 +611,12 @@ async def chat_with_user(
                 now=now,
                 text=text,
                 mode="no_results",
+                actions=[],
+                links=[],
                 debug={"resolved_role": resolved_role, "search_keywords": search_keywords, "income_type": income_type},
             )
 
+        # Hidden layer: raw jobs -> JobCards
         cards = to_job_cards(
             jobs,
             role_canon=_role_logic(state) or resolved_role,
@@ -567,9 +624,11 @@ async def chat_with_user(
             income_type=income_type,
         )
         state["cached_jobs"] = cards
+
         state["jobs_shown"] = True
         state["phase"] = "results_found"
 
+        # Optional: keep saving raw jobs for analytics/history
         for job in jobs:
             save_user_job(str(user_id), job)
 
@@ -597,6 +656,7 @@ async def chat_with_user(
             text=text,
             mode="results_found",
             actions=actions,
+            links=[],
             debug={
                 "resolved_role": resolved_role,
                 "search_keywords": search_keywords,
@@ -608,4 +668,7 @@ async def chat_with_user(
     # 11) Fallback
     reply = await generate_coached_reply(state, memory, user_message)
     reply = reply.strip() or "Tell me the role and location you want, and I’ll find jobs."
-    return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text=reply)
+    return _remember_and_return(
+        user_id=user_id, sessions=sessions, session=session, now=now, text=reply, actions=[], links=[]
+    )
+
