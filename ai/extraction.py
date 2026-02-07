@@ -4,12 +4,14 @@ from __future__ import annotations
 import difflib
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from ai.client import client
-from ai.role_resolver import build_search_keywords, canonicalize_role, resolve_role_from_dataset
-from core.state_machine import advance_phase
-from telemetry.logger import log_event
+from ai.role_resolver import (
+    build_search_keywords,
+    canonicalize_role,
+    resolve_role_from_dataset,
+)
 
 # -------------------------------------------------------------------
 # Constants
@@ -18,16 +20,12 @@ from telemetry.logger import log_event
 _STOP: str = r"(?:\s+(?:in|near|based in|based)\b|[.,;!?]|$)"
 NEW_SEARCH_RE = re.compile(r"\b(find|search|look for|can you find|what about)\b", re.I)
 
-# Add more cities as you see them in real usage (Dundee added).
 UK_CITIES: List[str] = [
     "Edinburgh",
-    "Glasgow",
-    "Dundee",
-    "Aberdeen",
-    "St Andrews",
     "London",
     "Manchester",
     "Bristol",
+    "Glasgow",
     "Leeds",
     "Liverpool",
     "Belfast",
@@ -54,8 +52,6 @@ ROLE_SYNONYMS: Dict[str, str] = {
     "data analyst": "Data Analyst",
     "data scientist": "Data Scientist",
     "mobile developer": "Mobile Developer",
-    "it support": "IT Support Technician",
-    "support technician": "IT Support Technician",
     # Hospitality
     "waiter": "Waiter",
     "waitress": "Waiter",
@@ -70,9 +66,7 @@ ROLE_SYNONYMS: Dict[str, str] = {
     "teacher": "Teacher",
     "driver": "Driver",
     "delivery driver": "Driver",
-    "marketing": "Marketing Assistant",
 }
-
 
 __all__ = [
     "extract_signals",
@@ -105,18 +99,6 @@ def _strip_fillers(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-def _first_clause(text: str) -> str:
-    """
-    Prevent “well water technician” style failures by focusing on the first search clause.
-    Examples:
-      "part time as a waiter in Edinburgh while I find..." -> take up to "while"
-    """
-    t = (text or "").strip()
-    # Split on common “secondary intent” connectors
-    parts = re.split(r"\b(while|then|but|however|until|and then|so that)\b", t, flags=re.I)
-    return (parts[0] or t).strip()
-
-
 def normalize_income_type(user_text: str) -> Optional[str]:
     low = (user_text or "").lower()
     for key, variants in STANDARD_INCOME_TYPES.items():
@@ -146,40 +128,6 @@ def map_role_synonym(role_text: str, cutoff: float = 0.72) -> str:
     return best_match if best_match else role_text.title()
 
 
-def _best_city_match(loc: str) -> str:
-    loc = (loc or "").strip().title()
-    if not loc:
-        return ""
-    matches = difflib.get_close_matches(loc, UK_CITIES, n=1, cutoff=0.7)
-    return matches[0] if matches else loc
-
-
-def _extract_role_loc_regex(text: str) -> Tuple[str, str]:
-    """
-    Prefer patterns like:
-      "part time as a waiter in Edinburgh"
-      "looking for a waiter in Edinburgh"
-      "waiter in Edinburgh"
-    """
-    low = (text or "").lower().strip()
-
-    # role in location
-    m = re.search(r"\b(?:as a|as an|work as|job as|be a|be an|looking for|find)\s+(.+?)\s+(?:in|near|based in|based)\s+(.+?)" + _STOP, low, re.I)
-    if m:
-        return (m.group(1).strip(), m.group(2).strip())
-
-    m = re.search(r"\b(.+?)\s+(?:in|near|based in|based)\s+(.+?)" + _STOP, low, re.I)
-    if m:
-        return (m.group(1).strip(), m.group(2).strip())
-
-    return ("", "")
-
-
-# -------------------------------------------------------------------
-# Role normalization utilities
-# -------------------------------------------------------------------
-
-
 def normalize_role_for_api(role: str) -> str:
     role = (role or "").strip()
     if not role:
@@ -196,8 +144,8 @@ async def normalize_role_with_api(role: str) -> str:
 
     prompt = (
         "Clean and normalize this job role for a job search.\n"
-        "- Remove filler like 'job', 'jobs', 'position', 'role'.\n"
-        "- Remove time/contract modifiers like full-time/part-time/weekend/night/seasonal.\n"
+        "- Remove words like job/jobs/position/role.\n"
+        "- Remove time/contract modifiers (full-time/part-time/night/weekend/seasonal).\n"
         "- Return ONLY the job title.\n"
         "- No quotes.\n\n"
         f"Text: {role}"
@@ -236,68 +184,56 @@ async def extract_dynamic_keywords(user_message: str) -> Dict[str, Any]:
 
 
 # -------------------------------------------------------------------
-# Signal extraction
+# Signal extraction (job search signals only)
 # -------------------------------------------------------------------
 
 
 async def extract_signals(message: str, state: Dict[str, Any]) -> None:
-    raw = (message or "").strip()
-    low = raw.lower().strip()
-
-    # 0) Small talk marker
-    if any(w in low for w in {"thanks", "thank you", "ok", "cool", "nice", "helpful", "great"}):
-        state["last_small_talk"] = raw
+    low = (message or "").lower().strip()
 
     # 1) Income type
     explicit_income = normalize_income_type(low)
     if explicit_income:
         state["income_type"] = explicit_income
 
-    # 2) Use first clause for search extraction
-    primary = _first_clause(raw)
-    primary_low = primary.lower()
-
-    # 3) Regex first (fast + reliable)
-    role_r, loc_r = _extract_role_loc_regex(primary)
-
-    # 4) AI assist if regex is weak
+    # 2) AI extraction for role/location
     ai_role: Optional[str] = None
     ai_location: Optional[str] = None
     ai_income: Optional[str] = None
+    ai_salary: Optional[str] = None
 
     try:
-        ai_keywords = await extract_dynamic_keywords(_strip_fillers(primary))
+        ai_keywords = await extract_dynamic_keywords(_strip_fillers(message))
         ai_role = ai_keywords.get("role")
         ai_location = ai_keywords.get("location")
         ai_income = ai_keywords.get("income_type")
+        ai_salary = ai_keywords.get("salary")
     except Exception:
         pass
 
-    # Apply AI income if present
-    if isinstance(ai_income, str) and ai_income.strip() and not state.get("income_type"):
-        inc = normalize_income_type(ai_income) or ai_income.strip().lower()
-        if inc in STANDARD_INCOME_TYPES:
-            state["income_type"] = inc
+    if isinstance(ai_income, str) and ai_income.strip():
+        state["income_type"] = ai_income.strip().lower()
 
-    # 5) Choose role candidate
-    role_candidate = ""
-    if role_r:
-        role_candidate = role_r
-        role_source = "regex"
-    elif isinstance(ai_role, str) and ai_role.strip():
+    if isinstance(ai_salary, str) and ai_salary.strip():
+        state["salary"] = ai_salary.strip()
+
+    # 3) Role candidate
+    role_candidate: str = ""
+    if isinstance(ai_role, str) and ai_role.strip():
         role_candidate = ai_role.strip()
-        role_source = "ai"
     else:
-        # last resort: stripped fillers, but DON'T let it swallow the whole sentence
-        role_candidate = _strip_fillers(primary)
-        role_source = "fallback"
+        role_match = re.search(
+            r"(?:work as|job as|be a|be an|looking for|i am a|i am an)\s+(.+?)" + _STOP,
+            low,
+            re.I,
+        )
+        if role_match:
+            role_candidate = role_match.group(1)
 
-    # Defensive: if role candidate still looks like a whole sentence, bail.
-    if len(role_candidate.split()) > 6 and role_source == "fallback":
-        role_candidate = ""
+    if not role_candidate:
+        role_candidate = _strip_fillers(message)
 
-    # Canonicalize
-    role_canon = canonicalize_role(role_candidate) if role_candidate else ""
+    role_canon = canonicalize_role(role_candidate)
 
     if role_canon:
         state["role_canon"] = role_canon
@@ -307,51 +243,26 @@ async def extract_signals(message: str, state: Dict[str, Any]) -> None:
         state["resolved_role"] = resolved
         state["role_query"] = build_search_keywords(resolved)
 
-        # legacy
+        # Backwards compat
         state["role_keywords"] = state["role_display"]
         state["role_raw"] = role_canon
 
-    # 6) Location
-    loc_candidate = ""
-    if loc_r:
-        loc_candidate = loc_r
-        loc_source = "regex"
-    elif isinstance(ai_location, str) and ai_location.strip():
-        loc_candidate = ai_location.strip()
-        loc_source = "ai"
+    # 4) Location
+    if isinstance(ai_location, str) and ai_location.strip():
+        loc = ai_location.strip().title()
     else:
-        m = re.search(r"\b(?:in|near|based in|based)\s+(.+?)" + _STOP, primary_low, re.I)
-        loc_candidate = m.group(1).strip() if m else ""
-        loc_source = "fallback"
+        loc_match = re.search(r"\b(?:in|near|based in|based)\s+(.+?)" + _STOP, low, re.I)
+        loc = loc_match.group(1).strip().title() if loc_match else None
 
-    if loc_candidate:
-        state["location"] = _best_city_match(loc_candidate)
+    if loc:
+        matches = difflib.get_close_matches(loc, UK_CITIES, n=1, cutoff=0.7)
+        state["location"] = matches[0] if matches else loc
 
-    # 7) Salary
-    salary_match = re.search(r"\b£?\d+(?:,\d{3})*(?:\s*(?:per|/)\s*(?:year|month|week|hour))?", low)
-    if salary_match:
-        state["salary"] = salary_match.group(0)
-
-    # 8) Store secondary intent (optional): what they said after "while..."
-    if primary != raw:
-        tail = raw[len(primary):].strip()
-        if tail:
-            state["note"] = tail[:200]
-
-    # 9) Advance phase
-    advance_phase(state)
-
-    # telemetry (no raw message)
-    log_event(
-        "signals_extracted",
-        {
-            "role_source": role_source if role_candidate else "none",
-            "loc_source": loc_source if loc_candidate else "none",
-            "role_canon": state.get("role_canon"),
-            "role_display": state.get("role_display"),
-            "location": state.get("location"),
-            "income_type": state.get("income_type"),
-            "has_note": bool(state.get("note")),
-        },
-        user_id=str(state.get("user_id") or ""),
-    )
+    # 5) Salary fallback regex
+    if "salary" not in state:
+        salary_match = re.search(
+            r"\b£?\d+(?:,\d{3})*(?:\s*(?:per|/)\s*(?:year|month|week|hour))?",
+            low,
+        )
+        if salary_match:
+            state["salary"] = salary_match.group(0)
