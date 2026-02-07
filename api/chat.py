@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List
-import re
+
 from core.chat_orchestrator import chat_with_user
 from core.auth_utils import get_current_user_id
 from memory.store import get_user_state
@@ -47,26 +47,8 @@ def _chat_response(
         "debug": debug or {},
     }
 
-_REFLECTIVE_PATTERNS = [
-    r"\bconfused\b",
-    r"\blost\b",
-    r"\bunsure\b",
-    r"\bnot sure\b",
-    r"\bdon't know\b",
-    r"\bwhat should i do\b",
-    r"\bfuture\b",
-    r"\bcareer\b",
-    r"\banxious\b",
-    r"\bstressed\b",
-]
-
-def _is_reflective(msg: str) -> bool:
-    m = msg.lower()
-    return any(re.search(p, m) for p in _REFLECTIVE_PATTERNS)
-
 
 def _friendly_error_message(error_code: str) -> str:
-    # Keep these short, calm, human.
     mapping = {
         "TIMEOUT": "That took too long on my end. Want to try again?",
         "UPSTREAM": "The job source is being slow right now. Try again in a moment?",
@@ -76,51 +58,32 @@ def _friendly_error_message(error_code: str) -> str:
     return mapping.get(error_code, mapping["INTERNAL"])
 
 
-def _welcome_message() -> str:
-    return (
-        "Welcome to Axis.\nThe Job Finding AI"
-    )
-
-
-
 # ----------------------------
 # Routes
 # ----------------------------
 @router.post("/chat")
 async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
     """
-    Handles chat requests. Memory & state are tied to authenticated user_id.
-    Always returns a 200-style payload so the UI never shows raw server errors.
+    Front door:
+    - Keep this file dumb.
+    - Always return 200-style payload to protect the Swift UI.
+    - Product logic lives in the orchestrator.
     """
     msg = (req.message or "").strip()
 
-    # ✅ Intent guard: don't run job-search pipeline on reflective input
-    if _is_reflective(msg):
-        return _chat_response(
-            "Totally fair. If you want, we can make this practical.\n"
-            "Tell me a role and a location (e.g. “waiter in Edinburgh” or “junior designer in Glasgow”).",
-            mode="chat",
-            debug={"intent": "reflective_redirect"},
-        )
-
-    # Optional: allow client to call /chat with "" on first load to get a warm intro
+    # If client ever pings with empty (shouldn't happen now), return a safe prompt.
     if not msg:
         return _chat_response("Tell me the role and location you’re looking for.", mode="chat")
 
-
     try:
-        # chat_with_user returns your normal payload
-        # expected keys: assistantText, mode, actions, jobs, links, debug
         result = await chat_with_user(user_id=str(user_id), user_message=msg)
 
-        # Safety net: if orchestrator ever returns None/odd shapes
         if not isinstance(result, dict):
             return _chat_response(
                 _friendly_error_message("INTERNAL"),
                 debug={"error_code": "INTERNAL", "where": "chat_orchestrator_return_shape"},
             )
 
-        # Ensure required keys exist (protect the Swift decoder from missing fields)
         return _chat_response(
             assistant_text=str(result.get("assistantText", "")),
             mode=str(result.get("mode", "chat")),
@@ -131,21 +94,12 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
         )
 
     except TimeoutError:
-        return _chat_response(
-            _friendly_error_message("TIMEOUT"),
-            debug={"error_code": "TIMEOUT"},
-        )
+        return _chat_response(_friendly_error_message("TIMEOUT"), debug={"error_code": "TIMEOUT"})
 
     except ValueError:
-        # Use this for parse/validation problems in your orchestrator
-        return _chat_response(
-            _friendly_error_message("VALIDATION"),
-            debug={"error_code": "VALIDATION"},
-        )
+        return _chat_response(_friendly_error_message("VALIDATION"), debug={"error_code": "VALIDATION"})
 
     except Exception as e:
-        # IMPORTANT: don’t leak raw error to user
-        # Do log it server-side if you have logging configured
         return _chat_response(
             _friendly_error_message("INTERNAL"),
             debug={"error_code": "INTERNAL", "detail": repr(e)},
@@ -203,5 +157,3 @@ async def submit_swipes(req: SwipeSubmitRequest, user_id: str = Depends(get_curr
         actions=actions,
         debug={"deckId": req.deckId},
     )
-
-
