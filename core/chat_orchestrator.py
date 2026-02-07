@@ -1,39 +1,36 @@
 # core/chat_orchestrator.py
+from __future__ import annotations
+
 import hashlib
-import uuid
 import re
+import uuid
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel
 
 from ai.extraction import extract_signals, NEW_SEARCH_RE
 from ai.generation import generate_coached_reply
-from ai.intent_router import classify_intent
-from ai.role_resolver import resolve_role_from_dataset, build_search_keywords, strip_time_modifiers
+from ai.intent import detect_intent
+from ai.role_resolver import build_search_keywords, resolve_role_from_dataset, strip_time_modifiers
 from jobs.adzuna import fetch_jobs
 from jobs.job_cards import to_job_cards
 from memory.store import (
-    get_user_state,
-    get_user_memory,
     append_user_memory,
-    save_user_job,
-    clear_user_state,
-    clear_user_memory,
     clear_user_jobs,
+    clear_user_memory,
+    clear_user_state,
+    get_user_memory,
+    get_user_state,
+    save_user_job,
 )
-from memory.profile_store import get_profile, update_profile
 from core.state_machine import next_discovery_question
 
-from core.handlers.side_hustle import handle_side_hustle
-from core.handlers.skills_profile import handle_skills_profile
+WELCOME_TEXT = "Welcome! I’m Axis.\nTell me the role and location you’re looking for."
 
-WELCOME_TEXT = (
-    "Hey 👋 Tell me what you want:\n"
-    "• job search (role + city)\n"
-    "• side hustle (extra income)\n"
-    "• skills chat (figure out direction)"
-)
+PIVOT_RE = re.compile(r"\b(actually|instead|change|different|switch|new\s+role|new\s+job)\b", re.I)
+ACK_ONLY_RE = re.compile(r"^\s*(thanks|thank you|ok|okay|cool|great)\s*[.!?]?\s*$", re.I)
+RESET_RE = re.compile(r"\b(reset|start over|new search|clear everything)\b", re.I)
 
 # -------------------------------------------------------------------
 # In-memory session tracker (not persisted)
@@ -117,6 +114,9 @@ def _strip_role_fields_in_state(state: Dict[str, Any]) -> None:
 
 def _reset_search_state(state: Dict[str, Any], *, keep_location: bool = True) -> None:
     loc = state.get("location") if keep_location else None
+    # keep clarity metadata if you want, but don't break search
+    clarity_level = state.get("clarity_level")
+    state.clear()
     state.update(
         {
             "phase": "discovery",
@@ -132,10 +132,7 @@ def _reset_search_state(state: Dict[str, Any], *, keep_location: bool = True) ->
             "role_canon": None,
             "role_query": None,
             "location": loc,
-
-            # extra flows
-            "skills_phase": state.get("skills_phase"),
-            "side_hustle_phase": state.get("side_hustle_phase"),
+            "clarity_level": clarity_level,
         }
     )
 
@@ -164,14 +161,6 @@ def _role_display(state: Dict[str, Any]) -> str:
     return (state.get("role_display") or state.get("role_keywords") or "").strip()
 
 
-# -------------------------------------------------------------------
-# Intent detection helpers
-# -------------------------------------------------------------------
-PIVOT_RE = re.compile(r"\b(actually|instead|change|different|switch|new\s+role|new\s+job)\b", re.I)
-ACK_ONLY_RE = re.compile(r"^\s*(thanks|thank you|ok|okay|cool|great)\s*[.!?]?\s*$", re.I)
-RESET_RE = re.compile(r"\b(reset|start over|new search|clear everything)\b", re.I)
-
-
 def _is_greeting(low: str) -> bool:
     return low in {"hi", "hello", "hey", "hiya"}
 
@@ -184,21 +173,13 @@ def _is_new_search_intent(low: str) -> bool:
     return bool(NEW_SEARCH_RE.search(low) or PIVOT_RE.search(low))
 
 
-# -------------------------------------------------------------------
-# Role resolution (dataset first, API fallback)
-# -------------------------------------------------------------------
 async def _resolve_role_for_search(state: Dict[str, Any]) -> Tuple[str, str]:
     role_input = _role_logic(state)
     role_input = strip_time_modifiers(role_input).strip()
 
-    resolved = resolve_role_from_dataset(role_input)
-    if resolved:
-        resolved = strip_time_modifiers(resolved).strip()
+    resolved = resolve_role_from_dataset(role_input) or role_input
+    resolved = strip_time_modifiers(resolved).strip().lower()
 
-    if not resolved:
-        resolved = role_input
-
-    resolved = resolved.lower().strip()
     search_keywords = build_search_keywords(resolved)
     return resolved, search_keywords
 
@@ -213,7 +194,7 @@ async def chat_with_user(
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     now = datetime.utcnow()
-    user_message = user_message or ""
+    user_message = (user_message or "").strip()
     low = user_message.lower().strip()
 
     sessions, session = _get_or_create_session(user_id, now)
@@ -223,10 +204,7 @@ async def chat_with_user(
     memory: List[Dict[str, Any]] = conversation_history or get_user_memory(str(user_id))
     append_user_memory(str(user_id), "user", user_message)
 
-    # Load profile (persistent)
-    profile = get_profile(str(user_id))
-
-    # 1) Greeting
+    # 1) Greeting (soft)
     if _is_greeting(low):
         return _remember_and_return(
             user_id=user_id,
@@ -234,112 +212,167 @@ async def chat_with_user(
             session=session,
             now=now,
             text=WELCOME_TEXT,
-            actions=[],
-            links=[],
             debug={"intent": "greeting"},
         )
 
-    # 2) Reset
+    # 2) Reset (hard)
     if RESET_RE.search(low):
         clear_user_state(str(user_id))
         clear_user_memory(str(user_id))
         clear_user_jobs(str(user_id))
         state = get_user_state(str(user_id))
-
         return _remember_and_return(
             user_id=user_id,
             sessions=sessions,
             session=session,
             now=now,
-            text="Alright, starting fresh. What do you want: job search, side hustle, or skills chat?",
-            actions=[],
-            links=[],
+            text="Alright, starting fresh. Tell me the role + location you want.",
             debug={"intent": "reset"},
         )
 
-    # 3) ACK
+    # 3) Acknowledgements
     if _is_ack(low):
         return _remember_and_return(
             user_id=user_id,
             sessions=sessions,
             session=session,
             now=now,
-            text="No worries. Want job search, side hustle, or skills chat?",
-            actions=[],
-            links=[],
+            text="No worries. Want to search for something else, or tweak role/location?",
             debug={"intent": "ack"},
         )
 
-    # 4) Intent router (this is the big upgrade)
-    route = await classify_intent(user_message, state=state, profile=profile)
-    intent = route.get("intent") or "CHAT"
-    signals = route.get("signals") or {}
+    # 4) Intent routing (the “alive” part)
+    intent = detect_intent(user_message, state)
 
-    # Persist some router signals into profile (optional, safe merge)
-    if signals:
-        # Keep it conservative
-        patch: Dict[str, Any] = {}
-        if isinstance(signals.get("constraints"), list) and signals["constraints"]:
-            patch["constraints"] = {"notes": ", ".join(signals["constraints"])}
-        if isinstance(signals.get("goal"), str) and signals["goal"].strip():
-            patch["goals"] = {"note": signals["goal"].strip()}
-        if isinstance(signals.get("preferred_mode"), str) and signals["preferred_mode"].strip():
-            patch["preferences"] = {"hustle_mode": signals["preferred_mode"].strip()}
-        if patch:
-            profile = update_profile(str(user_id), patch)
-
-    # 5) Route: SIDE_HUSTLE
-    if intent == "SIDE_HUSTLE" or state.get("side_hustle_phase"):
-        text, actions, dbg = handle_side_hustle(
-            user_id=str(user_id),
-            low=low,
-            user_message=user_message,
-            state=state,
-            profile=profile,
-            router_signals=signals,
+    # 4a) Side-hustle mode (V1)
+    if intent.name == "side_hustle":
+        state["phase"] = "side_hustle"
+        text = (
+            "Got you. Quick setup so I don’t give generic advice:\n"
+            "1) How many hours/week can you spare?\n"
+            "2) Do you prefer online (freelance) or in-person (local gigs)?\n"
+            "3) What skills do you already have (even hobbies)?"
         )
         return _remember_and_return(
-            user_id=user_id, sessions=sessions, session=session, now=now,
-            text=text, actions=actions, links=[], debug={**dbg, "router": route}
+            user_id=user_id,
+            sessions=sessions,
+            session=session,
+            now=now,
+            text=text,
+            debug={"intent": "side_hustle", "confidence": intent.confidence},
         )
 
-    # 6) Route: SKILLS_PROFILE
-    if intent == "SKILLS_PROFILE" or state.get("skills_phase"):
-        text, actions, dbg = handle_skills_profile(
-            user_id=str(user_id),
-            low=low,
-            user_message=user_message,
-            state=state,
-            profile=profile,
-            router_signals=signals,
-        )
-        return _remember_and_return(
-            user_id=user_id, sessions=sessions, session=session, now=now,
-            text=text, actions=actions, links=[], debug={**dbg, "router": route}
-        )
+    # 4b) Reflective mode: offer “clarity pass”
+    if intent.name == "reflective":
+        # If they already have both, don’t derail, just clarify
+        already_have_role = bool(_role_logic(state))
+        already_have_loc = bool((state.get("location") or "").strip())
 
-    # 7) Route: APPLICATION_HELP (simple v1)
-    if intent == "APPLICATION_HELP":
-        return _remember_and_return(
-            user_id=user_id, sessions=sessions, session=session, now=now,
-            text="Cool. Paste the job title + the main points from the listing, and I’ll help with CV/cover letter/interview prep.",
-            debug={"intent": "APPLICATION_HELP", "router": route},
-        )
+        if already_have_role and already_have_loc:
+            state["phase"] = "clarity_offer"
+            return _remember_and_return(
+                user_id=user_id,
+                sessions=sessions,
+                session=session,
+                now=now,
+                text="Got you. Want a quick clarity pass first, or should I continue the search you started?",
+                actions=[
+                    {"type": "YES_NO", "yesLabel": "Clarity pass", "yesValue": "clarity_yes",
+                     "noLabel": "Continue search", "noValue": "clarity_no"}
+                ],
+                debug={"intent": "reflective_with_context"},
+            )
 
-    # 8) CLARITY (simple v1)
-    if intent == "CLARITY":
+        state["phase"] = "clarity_offer"
         return _remember_and_return(
-            user_id=user_id, sessions=sessions, session=session, now=now,
+            user_id=user_id,
+            sessions=sessions,
+            session=session,
+            now=now,
             text=(
-                "Got you. Two ways:\n"
-                "1) Tell me a role + city and I’ll search.\n"
-                "2) Say ‘skills chat’ and I’ll help you choose a direction."
+                "Got you. Want a quick clarity pass (2 minutes) so I can suggest roles to search for?\n"
+                "Or if you already have something in mind, tell me a role + city."
             ),
-            debug={"intent": "CLARITY", "router": route},
+            actions=[{"type": "YES_NO", "yesValue": "clarity_yes", "noValue": "clarity_no"}],
+            debug={"intent": "clarity_offer", "confidence": intent.confidence},
         )
 
-    # 9) JOB_SEARCH pipeline (your existing engine)
-    # New search intent early
+    # 4c) Handle clarity yes/no + steps
+    phase = state.get("phase")
+
+    if phase == "clarity_offer":
+        if low in {"clarity_yes", "yes", "yeah", "yep"}:
+            state["phase"] = "clarity_level"
+            return _remember_and_return(
+                user_id=user_id,
+                sessions=sessions,
+                session=session,
+                now=now,
+                text=(
+                    "Cool. What’s your experience level?\n"
+                    "1) Student  2) Entry  3) 1–3 yrs  4) 3–7 yrs  5) 7+ yrs"
+                ),
+                debug={"intent": "clarity_level"},
+            )
+
+        if low in {"clarity_no", "no", "nah", "nope"}:
+            state["phase"] = "discovery"
+            return _remember_and_return(
+                user_id=user_id,
+                sessions=sessions,
+                session=session,
+                now=now,
+                text="All good. Tell me the role + city you want and I’ll pull listings.",
+                debug={"intent": "clarity_declined"},
+            )
+
+        return _remember_and_return(
+            user_id=user_id,
+            sessions=sessions,
+            session=session,
+            now=now,
+            text="Do you want the quick clarity pass? Yes or no.",
+            actions=[{"type": "YES_NO", "yesValue": "clarity_yes", "noValue": "clarity_no"}],
+            debug={"intent": "clarity_offer_repeat"},
+        )
+
+    if phase == "clarity_level":
+        if "student" in low or low.strip() == "1":
+            state["clarity_level"] = "student"
+        elif "entry" in low or low.strip() == "2":
+            state["clarity_level"] = "entry"
+        elif "1-3" in low or "1–3" in low or low.strip() == "3":
+            state["clarity_level"] = "1-3"
+        elif "3-7" in low or "3–7" in low or low.strip() == "4":
+            state["clarity_level"] = "3-7"
+        elif "7" in low or low.strip() == "5":
+            state["clarity_level"] = "7+"
+        else:
+            return _remember_and_return(
+                user_id=user_id,
+                sessions=sessions,
+                session=session,
+                now=now,
+                text="Pick one number: 1) Student  2) Entry  3) 1–3 yrs  4) 3–7 yrs  5) 7+ yrs",
+                debug={"intent": "clarity_level_reprompt"},
+            )
+
+        state["phase"] = "discovery"
+        return _remember_and_return(
+            user_id=user_id,
+            sessions=sessions,
+            session=session,
+            now=now,
+            text=(
+                "Nice. Now tell me either:\n"
+                "• a role + location to search (example: waiter in Edinburgh)\n"
+                "or\n"
+                "• two roles + your city (example: barista vs receptionist, Edinburgh)."
+            ),
+            debug={"intent": "clarity_to_search", "clarity_level": state.get("clarity_level")},
+        )
+
+    # 5) New search intent early (pivot rule)
     if _is_new_search_intent(low):
         _reset_search_state(state, keep_location=True)
 
@@ -347,7 +380,7 @@ async def chat_with_user(
     prev_loc = (state.get("location") or "").strip().lower()
     prev_income = (state.get("income_type") or "").strip().lower()
 
-    # Extract job signals into state
+    # 6) Extract signals (mutates state)
     await extract_signals(user_message, state)
     _strip_role_fields_in_state(state)
 
@@ -369,10 +402,10 @@ async def chat_with_user(
         state["location"] = keep_location_value
         state["role_canon"] = keep_role_canon
         state["role_display"] = keep_role_display
-        state["role_keywords"] = keep_role_display
+        state["role_keywords"] = keep_role_display  # legacy
         state["income_type"] = keep_income
 
-    # Post-swipe flow
+    # 7) Post-swipe flow
     if state.get("phase") == "post_swipe":
         deck = state.get("current_deck") or {}
         liked_ids = set(deck.get("liked") or [])
@@ -381,43 +414,45 @@ async def chat_with_user(
 
         if low in {"yes", "yeah", "yep", "talk_yes"}:
             state["phase"] = "discuss_likes"
-            text = "Cool. What matters most to you: pay, flexibility, location, or growth?"
-            return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text=text)
+            return _remember_and_return(
+                user_id=user_id, sessions=sessions, session=session, now=now,
+                text="Cool. What matters most to you: pay, flexibility, location, or growth?"
+            )
 
         if low in {"no", "n", "nah", "nope", "talk_no"}:
             links = [
                 {"label": f"{c.get('title','Job')} at {c.get('company','')}".strip(), "url": c.get("redirect_url", "")}
-                for c in liked_cards
-                if c.get("redirect_url")
+                for c in liked_cards if c.get("redirect_url")
             ]
             state["phase"] = "ready"
-            text = "All good. Here are the direct links to the ones you liked:"
-            return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text=text, links=links)
+            return _remember_and_return(
+                user_id=user_id, sessions=sessions, session=session, now=now,
+                text="All good. Here are the direct links to the ones you liked:",
+                links=links
+            )
 
-        text = "Quick one: do you want to talk about the jobs you liked? Yes or no."
         return _remember_and_return(
-            user_id=user_id,
-            sessions=sessions,
-            session=session,
-            now=now,
-            text=text,
+            user_id=user_id, sessions=sessions, session=session, now=now,
+            text="Quick one: do you want to talk about the jobs you liked? Yes or no.",
             mode="post_swipe",
             actions=[{"type": "YES_NO", "yesValue": "talk_yes", "noValue": "talk_no"}],
         )
 
-    # Discovery (ONLY if not ready)
+    # 8) Discovery question (ONLY if not ready)
     if state.get("phase") == "discovery" and not state.get("readiness"):
         q = next_discovery_question(state)
         if q:
             return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text=q)
 
-    # Income type clarification (only when role + location)
+    # 9) Income type clarification (only when we have role + location)
     if state.get("income_type") is None and not state.get("asked_income_type"):
         if _role_logic(state) and state.get("location"):
             state["asked_income_type"] = True
             role_text = _role_display(state) or "that role"
-            text = f"Do you want full-time or part-time {role_text} work in {state['location']}?"
-            return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text=text)
+            return _remember_and_return(
+                user_id=user_id, sessions=sessions, session=session, now=now,
+                text=f"Do you want full-time or part-time {role_text} work in {state['location']}?"
+            )
 
     if state.get("asked_income_type"):
         if "part" in low:
@@ -427,17 +462,24 @@ async def chat_with_user(
             state["income_type"] = "full-time"
             state["jobs_shown"] = False
         else:
-            return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text="Full-time or part-time?")
+            return _remember_and_return(
+                user_id=user_id, sessions=sessions, session=session, now=now,
+                text="Full-time or part-time?"
+            )
         state["asked_income_type"] = False
 
-    # Fetch jobs -> cards -> deck
+    # 10) Fetch jobs -> cards -> deck (only if role+location exist)
     if _role_logic(state) and state.get("location") and not state.get("jobs_shown"):
         income_type = state.get("income_type") or "job"
         resolved_role, search_keywords = await _resolve_role_for_search(state)
         state["resolved_role"] = resolved_role
         state["role_query"] = search_keywords
 
-        jobs = await fetch_jobs(role_keywords=search_keywords, location=state["location"], income_type=income_type)
+        jobs = await fetch_jobs(
+            role_keywords=search_keywords,
+            location=state["location"],
+            income_type=income_type,
+        )
 
         uniq = {(j.get("title", ""), j.get("company", ""), j.get("location", "")): j for j in (jobs or [])}
         jobs = list(uniq.values())
@@ -448,16 +490,15 @@ async def chat_with_user(
         if not jobs:
             state["jobs_shown"] = False
             state["phase"] = "no_results"
-            text = (
-                f"I couldn’t find any listings for '{resolved_role or 'that role'}' in {state['location']}. "
-                "Try a nearby city, a broader title (e.g. 'software engineer'), or remove 'part-time'."
-            )
             return _remember_and_return(
                 user_id=user_id,
                 sessions=sessions,
                 session=session,
                 now=now,
-                text=text,
+                text=(
+                    f"I couldn’t find any listings for '{resolved_role or 'that role'}' in {state['location']}.\n"
+                    "Try a nearby city, a broader title (e.g. 'software engineer'), or remove 'part-time'."
+                ),
                 mode="no_results",
                 debug={"resolved_role": resolved_role, "search_keywords": search_keywords, "income_type": income_type},
             )
@@ -485,26 +526,21 @@ async def chat_with_user(
             "complete": False,
         }
 
-        text = (
-            f"Found {len(cards)} listings for '{resolved_role}' in {state['location']}. "
-            f"Want to swipe through the top {len(deck_cards)}?"
-        )
-        actions = [{"type": "OPEN_SWIPE", "label": "Swipe jobs", "deckId": deck_id}]
-
         return _remember_and_return(
             user_id=user_id,
             sessions=sessions,
             session=session,
             now=now,
-            text=text,
+            text=(
+                f"Found {len(cards)} listings for '{resolved_role}' in {state['location']}.\n"
+                f"Want to swipe through the top {len(deck_cards)}?"
+            ),
             mode="results_found",
-            actions=actions,
+            actions=[{"type": "OPEN_SWIPE", "label": "Swipe jobs", "deckId": deck_id}],
             debug={"resolved_role": resolved_role, "search_keywords": search_keywords, "totalFound": len(cards), "deckSize": len(deck_cards)},
         )
 
-    # 10) Fallback (chat coach)
+    # 11) Fallback chat reply (coached, but not pretending we searched)
     reply = await generate_coached_reply(state, memory, user_message)
-    reply = reply.strip() or "Tell me what you want: job search, side hustle, or skills chat."
-    return _remember_and_return(
-        user_id=user_id, sessions=sessions, session=session, now=now, text=reply, debug={"router": route}
-    )
+    reply = reply.strip() or "Tell me the role + location you want, and I’ll find jobs."
+    return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text=reply)

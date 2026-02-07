@@ -1,18 +1,15 @@
 # api/chat.py
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from core.chat_orchestrator import chat_with_user
+from core.chat_orchestrator import chat_with_user, WELCOME_TEXT
 from core.auth_utils import get_current_user_id
 from memory.store import get_user_state
 
 router = APIRouter()
 
 
-# ----------------------------
-# Request models
-# ----------------------------
 class ChatRequest(BaseModel):
     message: str
 
@@ -27,16 +24,13 @@ class SwipeSubmitRequest(BaseModel):
     passed: List[str] = Field(default_factory=list)
 
 
-# ----------------------------
-# Helpers: consistent responses
-# ----------------------------
 def _chat_response(
     assistant_text: str,
     mode: str = "chat",
-    actions: List[Dict[str, Any]] | None = None,
-    jobs: List[Dict[str, Any]] | None = None,
-    links: List[Dict[str, Any]] | None = None,
-    debug: Dict[str, Any] | None = None,
+    actions: Optional[List[Dict[str, Any]]] = None,
+    jobs: Optional[List[Dict[str, Any]]] = None,
+    links: Optional[List[Dict[str, Any]]] = None,
+    debug: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
         "assistantText": assistant_text,
@@ -52,32 +46,19 @@ def _friendly_error_message(error_code: str) -> str:
     mapping = {
         "TIMEOUT": "That took too long on my end. Want to try again?",
         "UPSTREAM": "The job source is being slow right now. Try again in a moment?",
-        "VALIDATION": "I didn’t catch that fully. Tell me what you want to do (job search, skills, or side hustle).",
+        "VALIDATION": "I didn’t catch that fully. Tell me the role + location you want.",
         "INTERNAL": "Something slipped on my end. Try that again?",
     }
     return mapping.get(error_code, mapping["INTERNAL"])
 
 
-def _welcome_message() -> str:
-    return "Welcome to Axis.\nTell me what you want: job search, side hustle, or a quick skills chat."
-
-
-# ----------------------------
-# Routes
-# ----------------------------
 @router.post("/chat")
 async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
-    """
-    Front door:
-    - Keep this file dumb.
-    - Always return a 200-style payload to protect the Swift UI.
-    - Product logic lives in the orchestrator.
-    """
     msg = (req.message or "").strip()
 
-    # Allow client to ping with "" on first load for a welcome line
+    # Empty ping = welcome
     if not msg:
-        return _chat_response(_welcome_message(), mode="chat")
+        return _chat_response(WELCOME_TEXT, mode="chat")
 
     try:
         result = await chat_with_user(user_id=str(user_id), user_message=msg)
@@ -99,8 +80,10 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
 
     except TimeoutError:
         return _chat_response(_friendly_error_message("TIMEOUT"), debug={"error_code": "TIMEOUT"})
+
     except ValueError:
         return _chat_response(_friendly_error_message("VALIDATION"), debug={"error_code": "VALIDATION"})
+
     except Exception as e:
         return _chat_response(
             _friendly_error_message("INTERNAL"),

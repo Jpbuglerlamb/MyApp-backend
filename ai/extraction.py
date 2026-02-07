@@ -12,13 +12,14 @@ from ai.role_resolver import (
     canonicalize_role,
     resolve_role_from_dataset,
 )
+from core.state_machine import advance_phase
 
 # -------------------------------------------------------------------
 # Constants
 # -------------------------------------------------------------------
 
-_STOP: str = r"(?:\s+(?:in|near|based in|based)\b|[.,;!?]|$)"
-NEW_SEARCH_RE = re.compile(r"\b(find|search|look for|can you find|what about)\b", re.I)
+_STOP: str = r"(?:\s+(?:in|near|around|based in|based)\b|[.,;!?]|$)"
+NEW_SEARCH_RE = re.compile(r"\b(find|search|look for|can you find|what about|show me)\b", re.I)
 
 UK_CITIES: List[str] = [
     "Edinburgh",
@@ -30,43 +31,58 @@ UK_CITIES: List[str] = [
     "Liverpool",
     "Belfast",
     "Cardiff",
+    "Dundee",
+    "Aberdeen",
 ]
 
 STANDARD_INCOME_TYPES: Dict[str, List[str]] = {
     "full-time": ["full time", "full-time", "permanent"],
     "part-time": ["part time", "part-time", "casual", "zero hour", "zero-hours", "zero hours"],
     "temporary": ["temporary", "temp", "short-term"],
-    "freelance": ["freelance", "gig", "self-employed", "contract"],
+    "freelance": ["freelance", "gig", "self-employed"],
+    "contract": ["contract", "contractor"],
     "internship": ["intern", "internship", "trainee"],
 }
 
+# Display role synonyms (UX)
 ROLE_SYNONYMS: Dict[str, str] = {
     # Tech
-    "app development": "Software Developer",
     "software engineer": "Software Developer",
+    "software developer": "Software Developer",
     "web developer": "Software Developer",
+    "app developer": "Software Developer",
     "frontend": "Frontend Developer",
+    "front end": "Frontend Developer",
     "backend": "Backend Developer",
-    "ux": "UX Designer",
-    "ui": "UI Designer",
+    "back end": "Backend Developer",
     "data analyst": "Data Analyst",
     "data scientist": "Data Scientist",
-    "mobile developer": "Mobile Developer",
+    "ui designer": "UI Designer",
+    "ux designer": "UX Designer",
+    "product designer": "Product Designer",
     # Hospitality
     "waiter": "Waiter",
     "waitress": "Waiter",
     "waiting staff": "Waiter",
     "server": "Waiter",
-    "bar staff": "Bartender",
     "bartender": "Bartender",
+    "bar staff": "Bartender",
     "barista": "Barista",
     "chef": "Chef",
     "cook": "Chef",
-    # Other
-    "teacher": "Teacher",
+    # Other common
     "driver": "Driver",
     "delivery driver": "Driver",
+    "customer service": "Customer Service",
+    "sales": "Sales",
+    "marketing": "Marketing",
 }
+
+# If these appear, they are NOT part of a role, they are “context glue”
+_CONTEXT_CLAUSES_RE = re.compile(
+    r"\b(while|until|so that|because|as i|so i can|then i|and then|to fund|to pay)\b.*$",
+    re.I,
+)
 
 __all__ = [
     "extract_signals",
@@ -84,19 +100,18 @@ __all__ = [
 
 
 def _strip_fillers(text: str) -> str:
-    t = (text or "").lower()
-    fillers = [
-        "i'm", "im", "i am",
-        "looking", "looking for", "looking at",
-        "i want", "i need",
-        "find me", "search", "show me",
-        "a", "an", "the",
-        "job", "jobs", "role", "position", "work",
-        "please", "thanks",
-    ]
-    for f in fillers:
-        t = re.sub(rf"\b{re.escape(f)}\b", "", t)
-    return re.sub(r"\s+", " ", t).strip()
+    """
+    Remove filler words, but do NOT delete role words.
+    Keep it conservative.
+    """
+    t = (text or "").strip()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _drop_context_clauses(text: str) -> str:
+    """Remove trailing 'while I...' style clauses that should not become role text."""
+    return re.sub(_CONTEXT_CLAUSES_RE, "", (text or "").strip()).strip()
 
 
 def normalize_income_type(user_text: str) -> Optional[str]:
@@ -128,10 +143,70 @@ def map_role_synonym(role_text: str, cutoff: float = 0.72) -> str:
     return best_match if best_match else role_text.title()
 
 
+def _best_city_match(loc: str) -> str:
+    loc = (loc or "").strip().title()
+    if not loc:
+        return ""
+    matches = difflib.get_close_matches(loc, UK_CITIES, n=1, cutoff=0.70)
+    return matches[0] if matches else loc
+
+
+def _extract_location_fallback(message: str) -> Optional[str]:
+    low = (message or "").lower()
+
+    # direct "in X"
+    m = re.search(r"\b(?:in|near|around|based in|based)\s+(.+?)" + _STOP, low, re.I)
+    if m:
+        return _best_city_match(m.group(1))
+
+    # if user just types a city name
+    for c in UK_CITIES:
+        if c.lower() in low:
+            return c
+    return None
+
+
+def _extract_role_fallback(message: str) -> str:
+    """
+    Try: "as a waiter", "looking for waiter", "job as waiter", etc.
+    If not found, return "" (do NOT dump whole sentence).
+    """
+    low = (message or "").lower().strip()
+
+    # kill trailing context clause early
+    cleaned = _drop_context_clauses(low)
+
+    patterns = [
+        r"(?:work as|job as|as a|as an|be a|be an)\s+(.+?)" + _STOP,
+        r"(?:looking for|find me|search for|need)\s+(.+?)" + _STOP,
+        r"(?:role|position)\s+(?:as)?\s*(.+?)" + _STOP,
+    ]
+    for p in patterns:
+        m = re.search(p, cleaned, re.I)
+        if m:
+            candidate = (m.group(1) or "").strip()
+            candidate = re.sub(r"\b(full[-\s]?time|part[-\s]?time|permanent|temporary|contract)\b", "", candidate, flags=re.I)
+            candidate = candidate.strip()
+            return candidate
+
+    # try a synonym keyword presence
+    for key in ROLE_SYNONYMS.keys():
+        if key in cleaned:
+            return key
+
+    return ""
+
+
+# -------------------------------------------------------------------
+# Role normalization utilities
+# -------------------------------------------------------------------
+
+
 def normalize_role_for_api(role: str) -> str:
     role = (role or "").strip()
     if not role:
         return ""
+
     role = canonicalize_role(role)
     role = resolve_role_from_dataset(role) or role
     return build_search_keywords(role).strip()
@@ -144,9 +219,9 @@ async def normalize_role_with_api(role: str) -> str:
 
     prompt = (
         "Clean and normalize this job role for a job search.\n"
-        "- Remove words like job/jobs/position/role.\n"
-        "- Remove time/contract modifiers (full-time/part-time/night/weekend/seasonal).\n"
-        "- Return ONLY the job title.\n"
+        "- Remove words like 'job', 'jobs', 'position', 'role'.\n"
+        "- Remove contract/time modifiers like full-time/part-time/seasonal/evening/night/weekend.\n"
+        "- Return only the job title.\n"
         "- No quotes.\n\n"
         f"Text: {role}"
     )
@@ -168,6 +243,7 @@ async def extract_dynamic_keywords(user_message: str) -> Dict[str, Any]:
         "Return ONLY valid minified JSON.\n"
         "Keys: role, location, income_type, salary.\n"
         "If unknown, use null.\n"
+        "Role must be ONLY the job title (no 'while', no extra plans).\n"
         f"Text: {user_message}"
     )
 
@@ -184,85 +260,92 @@ async def extract_dynamic_keywords(user_message: str) -> Dict[str, Any]:
 
 
 # -------------------------------------------------------------------
-# Signal extraction (job search signals only)
+# Signal extraction
 # -------------------------------------------------------------------
 
 
 async def extract_signals(message: str, state: Dict[str, Any]) -> None:
-    low = (message or "").lower().strip()
+    msg = (message or "").strip()
+    low = msg.lower().strip()
+
+    # 0) Small talk marker
+    small_talk_keywords = {"thanks", "thank you", "ok", "okay", "cool", "nice", "helpful", "great"}
+    if any(w in low for w in small_talk_keywords):
+        state["last_small_talk"] = msg
 
     # 1) Income type
     explicit_income = normalize_income_type(low)
     if explicit_income:
         state["income_type"] = explicit_income
 
-    # 2) AI extraction for role/location
+    # 2) Ask AI for role/location (but do not trust blindly)
     ai_role: Optional[str] = None
     ai_location: Optional[str] = None
     ai_income: Optional[str] = None
     ai_salary: Optional[str] = None
 
-    try:
-        ai_keywords = await extract_dynamic_keywords(_strip_fillers(message))
-        ai_role = ai_keywords.get("role")
-        ai_location = ai_keywords.get("location")
-        ai_income = ai_keywords.get("income_type")
-        ai_salary = ai_keywords.get("salary")
-    except Exception:
-        pass
+    ai_payload = await extract_dynamic_keywords(_strip_fillers(_drop_context_clauses(msg)))
+    if isinstance(ai_payload, dict):
+        ai_role = ai_payload.get("role")
+        ai_location = ai_payload.get("location")
+        ai_income = ai_payload.get("income_type")
+        ai_salary = ai_payload.get("salary")
 
     if isinstance(ai_income, str) and ai_income.strip():
-        state["income_type"] = ai_income.strip().lower()
+        # allow AI to set it too, but only if known keyword
+        normalized = normalize_income_type(ai_income)
+        if normalized:
+            state["income_type"] = normalized
 
-    if isinstance(ai_salary, str) and ai_salary.strip():
-        state["salary"] = ai_salary.strip()
-
-    # 3) Role candidate
-    role_candidate: str = ""
-    if isinstance(ai_role, str) and ai_role.strip():
-        role_candidate = ai_role.strip()
-    else:
-        role_match = re.search(
-            r"(?:work as|job as|be a|be an|looking for|i am a|i am an)\s+(.+?)" + _STOP,
-            low,
-            re.I,
-        )
-        if role_match:
-            role_candidate = role_match.group(1)
+    # 3) Role candidate selection (prefer AI role if short + sane)
+    role_candidate = ""
+    if isinstance(ai_role, str):
+        r = ai_role.strip()
+        # guard: avoid whole sentence role
+        if 1 <= len(r.split()) <= 6:
+            role_candidate = r
 
     if not role_candidate:
-        role_candidate = _strip_fillers(message)
+        role_candidate = _extract_role_fallback(msg)
 
-    role_canon = canonicalize_role(role_candidate)
+    # If still none, do NOT set role from entire message
+    if role_candidate:
+        role_candidate = _drop_context_clauses(role_candidate)
+        role_canon = canonicalize_role(role_candidate)
 
-    if role_canon:
-        state["role_canon"] = role_canon
-        state["role_display"] = map_role_synonym(role_canon)
+        if role_canon:
+            state["role_canon"] = role_canon
+            state["role_display"] = map_role_synonym(role_canon)
 
-        resolved = resolve_role_from_dataset(role_canon) or role_canon
-        state["resolved_role"] = resolved
-        state["role_query"] = build_search_keywords(resolved)
+            resolved = resolve_role_from_dataset(role_canon) or role_canon
+            state["resolved_role"] = resolved
+            state["role_query"] = build_search_keywords(resolved)
 
-        # Backwards compat
-        state["role_keywords"] = state["role_display"]
-        state["role_raw"] = role_canon
+            # legacy/backwards compat
+            state["role_keywords"] = state["role_display"]
+            state["role_raw"] = role_canon
 
-    # 4) Location
+    # 4) Location candidate selection
+    loc_candidate: Optional[str] = None
     if isinstance(ai_location, str) and ai_location.strip():
-        loc = ai_location.strip().title()
+        loc_candidate = _best_city_match(ai_location)
+
+    if not loc_candidate:
+        loc_candidate = _extract_location_fallback(msg)
+
+    if loc_candidate:
+        state["location"] = loc_candidate
+
+    # 5) Salary
+    if isinstance(ai_salary, str) and ai_salary.strip():
+        state["salary"] = ai_salary.strip()
     else:
-        loc_match = re.search(r"\b(?:in|near|based in|based)\s+(.+?)" + _STOP, low, re.I)
-        loc = loc_match.group(1).strip().title() if loc_match else None
-
-    if loc:
-        matches = difflib.get_close_matches(loc, UK_CITIES, n=1, cutoff=0.7)
-        state["location"] = matches[0] if matches else loc
-
-    # 5) Salary fallback regex
-    if "salary" not in state:
         salary_match = re.search(
             r"\b£?\d+(?:,\d{3})*(?:\s*(?:per|/)\s*(?:year|month|week|hour))?",
             low,
         )
         if salary_match:
             state["salary"] = salary_match.group(0)
+
+    # 6) Advance phase
+    advance_phase(state)
