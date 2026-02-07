@@ -52,10 +52,17 @@ def _friendly_error_message(error_code: str) -> str:
     mapping = {
         "TIMEOUT": "That took too long on my end. Want to try again?",
         "UPSTREAM": "The job source is being slow right now. Try again in a moment?",
-        "VALIDATION": "I didn’t catch that fully. Try: “waiter in Edinburgh” or “backend developer in London”.",
-        "INTERNAL": "Something slipped on my end. Want to try again?",
+        "VALIDATION": "I didn’t catch that fully. Tell me what role + location you want.",
+        "INTERNAL": "Something slipped on my end. Want to try that again?",
     }
     return mapping.get(error_code, mapping["INTERNAL"])
+
+
+WELCOME_TEXT = (
+    "Hey 👋\n"
+    "Tell me what you’re looking for.\n"
+    "Example: “waiter in Edinburgh” or “backend developer in London”."
+)
 
 
 # ----------------------------
@@ -66,14 +73,16 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
     """
     Front door:
     - Keep this file dumb.
-    - Always return a safe payload to protect Swift UI decoding.
+    - Always return 200-style payload to protect the Swift UI.
     - Product logic lives in the orchestrator.
     """
     msg = (req.message or "").strip()
 
-    # Allow client to ping with "" on first load to fetch a welcome line.
+    # Client can ping "" on first load
     if not msg:
-        return _chat_response("", mode="chat", debug={"intent": "empty_ping"})
+        # Optional: if you want to resume an ongoing flow, you can delegate to orchestrator here.
+        # For now: safe welcome.
+        return _chat_response(WELCOME_TEXT, mode="chat")
 
     try:
         result = await chat_with_user(user_id=str(user_id), user_message=msg)
@@ -150,7 +159,13 @@ async def submit_swipes(req: SwipeSubmitRequest, user_id: str = Depends(get_curr
     total = len(deck.get("job_ids") or [])
     assistant_text = f"Nice. You liked {len(req.liked)} out of {total}. Want to talk about the ones you liked?"
     actions = [
-        {"type": "YES_NO", "yesLabel": "Yes", "noLabel": "No", "yesValue": "yes", "noValue": "no"}
+        {
+            "type": "YES_NO",
+            "yesLabel": "Yes",
+            "noLabel": "No",
+            "yesValue": "yes",
+            "noValue": "no",
+        }
     ]
 
     return _chat_response(
