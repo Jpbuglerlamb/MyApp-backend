@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List
-
+import re
 from core.chat_orchestrator import chat_with_user
 from core.auth_utils import get_current_user_id
 from memory.store import get_user_state
@@ -47,6 +47,23 @@ def _chat_response(
         "debug": debug or {},
     }
 
+_REFLECTIVE_PATTERNS = [
+    r"\bconfused\b",
+    r"\blost\b",
+    r"\bunsure\b",
+    r"\bnot sure\b",
+    r"\bdon't know\b",
+    r"\bwhat should i do\b",
+    r"\bfuture\b",
+    r"\bcareer\b",
+    r"\banxious\b",
+    r"\bstressed\b",
+]
+
+def _is_reflective(msg: str) -> bool:
+    m = msg.lower()
+    return any(re.search(p, m) for p in _REFLECTIVE_PATTERNS)
+
 
 def _friendly_error_message(error_code: str) -> str:
     # Keep these short, calm, human.
@@ -61,9 +78,7 @@ def _friendly_error_message(error_code: str) -> str:
 
 def _welcome_message() -> str:
     return (
-        "Welcome to Axis"
-        
-        "The Job Finding AI"
+        "Welcome to Axis.\nThe Job Finding AI"
     )
 
 
@@ -79,9 +94,19 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
     """
     msg = (req.message or "").strip()
 
+    # ✅ Intent guard: don't run job-search pipeline on reflective input
+    if _is_reflective(msg):
+        return _chat_response(
+            "Totally fair. If you want, we can make this practical.\n"
+            "Tell me a role and a location (e.g. “waiter in Edinburgh” or “junior designer in Glasgow”).",
+            mode="chat",
+            debug={"intent": "reflective_redirect"},
+        )
+
     # Optional: allow client to call /chat with "" on first load to get a warm intro
     if not msg:
-        return _chat_response(_welcome_message(), mode="chat")
+        return _chat_response("Tell me the role and location you’re looking for.", mode="chat")
+
 
     try:
         # chat_with_user returns your normal payload
