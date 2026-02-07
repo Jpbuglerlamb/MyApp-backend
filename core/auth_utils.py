@@ -16,14 +16,10 @@ from jwt import PyJWTError
 # -------------------------------------------------------------------
 SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60  # 1 hour
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 if not SECRET_KEY:
-    # For production this MUST be set; failing fast prevents insecure tokens.
-    raise RuntimeError(
-        "Missing SECRET_KEY environment variable. "
-        "Set it in your server environment (e.g., Render → Service → Environment)."
-    )
+    raise RuntimeError("Missing SECRET_KEY environment variable")
 
 # -------------------------------------------------------------------
 # Password hashing (Argon2)
@@ -37,38 +33,33 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
 # -------------------------------------------------------------------
-# JWT token creation
+# JWT helpers
 # -------------------------------------------------------------------
 def create_access_token(user_id: str, expires_delta: Optional[timedelta] = None) -> str:
     now = datetime.now(timezone.utc)
     expire = now + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
 
     payload = {
-        "sub": str(user_id),
+        "sub": user_id,
         "iat": int(now.timestamp()),
         "exp": int(expire.timestamp()),
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
-# -------------------------------------------------------------------
-# JWT token verification
-# -------------------------------------------------------------------
 def decode_access_token(token: str) -> str:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = payload.get("sub")
         if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token (missing subject)")
-        return str(user_id)
-
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return user_id
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
-
     except PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # -------------------------------------------------------------------
-# FastAPI dependency (Bearer token)
+# FastAPI dependency (CORRECT)
 # -------------------------------------------------------------------
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -76,10 +67,9 @@ def get_current_user_id(
     creds: Optional[HTTPAuthorizationCredentials] = bearer_scheme,
 ) -> str:
     if creds is None:
-        # Clean 401 instead of FastAPI 422 “missing header”
         raise HTTPException(status_code=401, detail="Missing Authorization header")
 
     if creds.scheme.lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Invalid auth scheme (expected Bearer)")
+        raise HTTPException(status_code=401, detail="Invalid auth scheme")
 
     return decode_access_token(creds.credentials)
