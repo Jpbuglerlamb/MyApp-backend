@@ -1,29 +1,35 @@
 # core/auth_utils.py
-from datetime import datetime, timedelta
+from __future__ import annotations
+
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import jwt
-from fastapi import HTTPException, Header
+from fastapi import HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
 from jwt import PyJWTError
-import os
+
 # -------------------------------------------------------------------
 # Settings
 # -------------------------------------------------------------------
-SECRET_KEY = os.getenv("SECRET_KEY", "")
-if not SECRET_KEY:
-    raise RuntimeError("Missing SECRET_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60  # 1 hour
 
+if not SECRET_KEY:
+    # For production this MUST be set; failing fast prevents insecure tokens.
+    raise RuntimeError(
+        "Missing SECRET_KEY environment variable. "
+        "Set it in your server environment (e.g., Render → Service → Environment)."
+    )
+
 # -------------------------------------------------------------------
-# Use Argon2 instead of bcrypt
+# Password hashing (Argon2)
 # -------------------------------------------------------------------
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
-# -------------------------------------------------------------------
-# Password hashing
-# -------------------------------------------------------------------
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
@@ -34,10 +40,15 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 # JWT token creation
 # -------------------------------------------------------------------
 def create_access_token(user_id: str, expires_delta: Optional[timedelta] = None) -> str:
-    to_encode = {"sub": user_id}
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    now = datetime.now(timezone.utc)
+    expire = now + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+
+    payload = {
+        "sub": str(user_id),
+        "iat": int(now.timestamp()),
+        "exp": int(expire.timestamp()),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 # -------------------------------------------------------------------
 # JWT token verification
@@ -45,18 +56,30 @@ def create_access_token(user_id: str, expires_delta: Optional[timedelta] = None)
 def decode_access_token(token: str) -> str:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
+        user_id = payload.get("sub")
         if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return user_id
+            raise HTTPException(status_code=401, detail="Invalid token (missing subject)")
+        return str(user_id)
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+
     except PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # -------------------------------------------------------------------
-# FastAPI dependency
+# FastAPI dependency (Bearer token)
 # -------------------------------------------------------------------
-def get_current_user_id(authorization: str = Header(...)) -> str:
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header")
-    token = authorization[len("Bearer "):]
-    return decode_access_token(token)
+bearer_scheme = HTTPBearer(auto_error=False)
+
+def get_current_user_id(
+    creds: Optional[HTTPAuthorizationCredentials] = bearer_scheme,
+) -> str:
+    if creds is None:
+        # Clean 401 instead of FastAPI 422 “missing header”
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    if creds.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid auth scheme (expected Bearer)")
+
+    return decode_access_token(creds.credentials)
