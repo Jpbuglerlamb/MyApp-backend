@@ -52,8 +52,8 @@ def _friendly_error_message(error_code: str) -> str:
     mapping = {
         "TIMEOUT": "That took too long on my end. Want to try again?",
         "UPSTREAM": "The job source is being slow right now. Try again in a moment?",
-        "VALIDATION": "I didn’t catch that fully. Tell me the role and location you want.",
-        "INTERNAL": "Something slipped on my end. Try that again?",
+        "VALIDATION": "I didn’t catch that fully. Try: “waiter in Edinburgh” or “backend developer in London”.",
+        "INTERNAL": "Something slipped on my end. Want to try again?",
     }
     return mapping.get(error_code, mapping["INTERNAL"])
 
@@ -66,14 +66,14 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
     """
     Front door:
     - Keep this file dumb.
-    - Always return 200-style payload to protect the Swift UI.
+    - Always return a safe payload to protect Swift UI decoding.
     - Product logic lives in the orchestrator.
     """
     msg = (req.message or "").strip()
 
-    # If client ever pings with empty (shouldn't happen now), return a safe prompt.
+    # Allow client to ping with "" on first load to fetch a welcome line.
     if not msg:
-        return _chat_response("Tell me the role and location you’re looking for.", mode="chat")
+        return _chat_response("", mode="chat", debug={"intent": "empty_ping"})
 
     try:
         result = await chat_with_user(user_id=str(user_id), user_message=msg)
@@ -149,7 +149,9 @@ async def submit_swipes(req: SwipeSubmitRequest, user_id: str = Depends(get_curr
 
     total = len(deck.get("job_ids") or [])
     assistant_text = f"Nice. You liked {len(req.liked)} out of {total}. Want to talk about the ones you liked?"
-    actions = [{"type": "YES_NO", "yesValue": "talk_yes", "noValue": "talk_no"}]
+    actions = [
+        {"type": "YES_NO", "yesLabel": "Yes", "noLabel": "No", "yesValue": "yes", "noValue": "no"}
+    ]
 
     return _chat_response(
         assistant_text,
@@ -157,4 +159,3 @@ async def submit_swipes(req: SwipeSubmitRequest, user_id: str = Depends(get_curr
         actions=actions,
         debug={"deckId": req.deckId},
     )
-
