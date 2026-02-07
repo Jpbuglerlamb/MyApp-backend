@@ -6,18 +6,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import jwt
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from passlib.context import CryptContext
 from jwt import PyJWTError
+from passlib.context import CryptContext
 
 # -------------------------------------------------------------------
 # Settings
 # -------------------------------------------------------------------
-SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
+# Read at import time (expects .env to be loaded before importing this module)
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
 if not SECRET_KEY:
     raise RuntimeError("Missing SECRET_KEY environment variable")
 
@@ -40,7 +41,7 @@ def create_access_token(user_id: str, expires_delta: Optional[timedelta] = None)
     expire = now + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
 
     payload = {
-        "sub": user_id,
+        "sub": str(user_id),
         "iat": int(now.timestamp()),
         "exp": int(expire.timestamp()),
     }
@@ -52,20 +53,27 @@ def decode_access_token(token: str) -> str:
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
-        return user_id
+        return str(user_id)
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # -------------------------------------------------------------------
-# FastAPI dependency (CORRECT)
+# FastAPI dependency
 # -------------------------------------------------------------------
 bearer_scheme = HTTPBearer(auto_error=False)
 
 def get_current_user_id(
-    creds: Optional[HTTPAuthorizationCredentials] = bearer_scheme,
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
 ) -> str:
+    """
+    Returns the authenticated user id (JWT 'sub').
+
+    - If no Authorization header is present -> 401
+    - If scheme isn't Bearer -> 401
+    - If token invalid/expired -> 401
+    """
     if creds is None:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
 
@@ -73,3 +81,4 @@ def get_current_user_id(
         raise HTTPException(status_code=401, detail="Invalid auth scheme")
 
     return decode_access_token(creds.credentials)
+

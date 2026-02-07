@@ -1,13 +1,17 @@
 #main.py
-from fastapi import FastAPI
+from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+
+from fastapi import FastAPI, Depends
 from api.chat import router as chat_router
 from api.auth import router as auth_router
 from core.database import engine, Base
-from fastapi import Depends
 from core.auth_utils import get_current_user_id
+from api.deck import router as deck_router
 
 app = FastAPI(title="AI Aura")
-
+app.include_router(deck_router)
 app.include_router(auth_router)
 app.include_router(chat_router)
 
@@ -19,9 +23,6 @@ async def startup():
 @app.get("/")
 def health():
     return {"status": "ok"}
-
-from fastapi import Depends
-from core.auth_utils import get_current_user_id
 
 @app.get("/me")
 def get_me(user_id: str = Depends(get_current_user_id)):
