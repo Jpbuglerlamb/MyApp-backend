@@ -9,6 +9,9 @@ from api.auth import router as auth_router
 from core.database import engine, Base
 from core.auth_utils import get_current_user_id
 from api.deck import router as deck_router
+from models.user import User
+from models.refresh_token import RefreshToken
+
 
 app = FastAPI(title="AI Aura")
 app.include_router(deck_router)
