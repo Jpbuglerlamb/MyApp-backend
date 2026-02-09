@@ -19,10 +19,14 @@ def advance_phase(state: dict) -> None:
     state["readiness"] = bool(is_ready(state))
 
 def next_discovery_question(state: dict) -> str | None:
-    asked = state.get("asked_questions", [])
-    for question in DISCOVERY_QUESTIONS:
-        if question not in asked:
-            asked.append(question)
-            state["asked_questions"] = asked
-            return question
+    if not state.get("role_canon"):
+        return "What role are you interested in?"
+
+    if not state.get("location"):
+        return "Which city or location do you prefer?"
+
+    if not state.get("income_type"):
+        return "Are you looking for full-time or part-time work?"
+
     return None
+
