@@ -15,6 +15,7 @@ from ai.intent import detect_intent
 from ai.role_resolver import build_search_keywords, resolve_role_from_dataset, strip_time_modifiers
 from jobs.adzuna import fetch_jobs
 from jobs.job_cards import to_job_cards
+from memory.chat_store_sqlite import add_message, get_messages
 from memory.store import (
     append_user_memory,
     clear_user_jobs,
@@ -85,7 +86,7 @@ def _remember_and_return(
     links: Optional[list] = None,
     debug: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    append_user_memory(str(user_id), "assistant", text)
+    append_user_memory(conversation_id, "assistant", text)
     session.messages.append(ChatMessage(text=text, sender="ai", timestamp=now))
     user_sessions[user_id] = sessions
     return make_response(text, mode=mode, actions=actions, jobs=jobs, links=links, debug=debug)
@@ -190,9 +191,11 @@ async def _resolve_role_for_search(state: Dict[str, Any]) -> Tuple[str, str]:
 async def chat_with_user(
     *,
     user_id: str,
+    conversation_id: str,
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+
     now = datetime.utcnow()
     user_message = (user_message or "").strip()
     low = user_message.lower().strip()
@@ -200,9 +203,11 @@ async def chat_with_user(
     sessions, session = _get_or_create_session(user_id, now)
     session.messages.append(ChatMessage(text=user_message, sender="user", timestamp=now))
 
-    state: Dict[str, Any] = get_user_state(str(user_id))
-    memory: List[Dict[str, Any]] = conversation_history or get_user_memory(str(user_id))
-    append_user_memory(str(user_id), "user", user_message)
+    key = conversation_id
+    state = get_user_state(key)
+    memory = conversation_history or get_user_memory(key)
+    append_user_memory(key, "user", user_message)
+
 
     # 1) Greeting (soft)
     if _is_greeting(low):
@@ -335,6 +340,7 @@ async def chat_with_user(
             actions=[{"type": "YES_NO", "yesValue": "clarity_yes", "noValue": "clarity_no"}],
             debug={"intent": "clarity_offer_repeat"},
         )
+    
 
     if phase == "clarity_level":
         if "student" in low or low.strip() == "1":

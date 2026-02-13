@@ -14,7 +14,8 @@ router = APIRouter()
 # --------- Models (match iOS decoding) ---------
 
 class ChatRequest(BaseModel):
-    message: str = ""
+    message: Optional[str] = None
+    conversation_id: str
 
 class ActionItem(BaseModel):
     type: str
@@ -52,7 +53,10 @@ async def chat(
 
     try:
         # Expect your orchestrator to return a dict-like payload
-        result: Dict[str, Any] = await chat_with_user(user_id=user_id, user_message=msg)
+        result: Dict[str, Any] = await chat_with_user(
+            user_id=user_id, 
+            conversation_id=req.conversation_id,
+            user_message=msg)
         
         assistant_text = (result.get("assistantText") or result.get("assistant_text") or "").strip()
         actions = result.get("actions") or []
