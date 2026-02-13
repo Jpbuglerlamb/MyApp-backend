@@ -73,9 +73,12 @@ async def _issue_refresh_token(session: AsyncSession, user_id: int) -> str:
 # Signup
 # -------------------------------
 @router.post("/signup", response_model=AuthResponse)
+
 async def signup(req: SignupRequest, session: AsyncSession = Depends(get_async_session)):
     email = _norm_email(req.email)
-
+    print("BACKEND emial repr:", repr(req.email))
+    print("BACKEND email:", req.email)
+    
     result = await session.execute(select(User).where(User.email == email))
     existing_user = result.scalars().first()
     if existing_user:
@@ -89,6 +92,7 @@ async def signup(req: SignupRequest, session: AsyncSession = Depends(get_async_s
     access = create_access_token(str(user.id))
     refresh = await _issue_refresh_token(session, user.id)
     return {"userId": user.id, "accessToken": access, "refreshToken": refresh}
+   
 
 
 # -------------------------------
