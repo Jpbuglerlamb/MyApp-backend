@@ -15,7 +15,8 @@ from ai.intent import detect_intent
 from ai.role_resolver import build_search_keywords, resolve_role_from_dataset, strip_time_modifiers
 from jobs.adzuna import fetch_jobs
 from jobs.job_cards import to_job_cards
-from memory.chat_store_sqlite import add_message, get_messages
+from core.state_machine import next_discovery_question
+
 from memory.store import (
     append_user_memory,
     clear_user_jobs,
@@ -25,7 +26,6 @@ from memory.store import (
     get_user_state,
     save_user_job,
 )
-from core.state_machine import next_discovery_question
 
 WELCOME_TEXT = "Welcome! I’m Axis.\nTell me the role and location you’re looking for."
 
@@ -35,6 +35,8 @@ RESET_RE = re.compile(r"\b(reset|start over|new search|clear everything)\b", re.
 
 # -------------------------------------------------------------------
 # In-memory session tracker (not persisted)
+# Note: This is separate from "state" in memory.store.
+# It is used only to keep a lightweight per-user transcript for debugging.
 # -------------------------------------------------------------------
 user_sessions: Dict[str, List["ChatSession"]] = {}
 
@@ -76,6 +78,7 @@ def make_response(
 def _remember_and_return(
     *,
     user_id: str,
+    conversation_id: str,
     sessions: List[ChatSession],
     session: ChatSession,
     now: datetime,
@@ -86,9 +89,13 @@ def _remember_and_return(
     links: Optional[list] = None,
     debug: Optional[dict] = None,
 ) -> Dict[str, Any]:
+    # Store assistant text in the same short-term key used for state
     append_user_memory(conversation_id, "assistant", text)
+
+    # Update in-memory session transcript (optional, non-persistent)
     session.messages.append(ChatMessage(text=text, sender="ai", timestamp=now))
     user_sessions[user_id] = sessions
+
     return make_response(text, mode=mode, actions=actions, jobs=jobs, links=links, debug=debug)
 
 
@@ -115,8 +122,8 @@ def _strip_role_fields_in_state(state: Dict[str, Any]) -> None:
 
 def _reset_search_state(state: Dict[str, Any], *, keep_location: bool = True) -> None:
     loc = state.get("location") if keep_location else None
-    # keep clarity metadata if you want, but don't break search
     clarity_level = state.get("clarity_level")
+
     state.clear()
     state.update(
         {
@@ -195,24 +202,25 @@ async def chat_with_user(
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-
     now = datetime.utcnow()
     user_message = (user_message or "").strip()
     low = user_message.lower().strip()
 
+    # Non-persistent transcript per user (optional)
     sessions, session = _get_or_create_session(user_id, now)
     session.messages.append(ChatMessage(text=user_message, sender="user", timestamp=now))
 
+    # IMPORTANT: state + memory are keyed by conversation_id (not user_id)
     key = conversation_id
     state = get_user_state(key)
-    memory = conversation_history or get_user_memory(key)
+    memory: List[Dict[str, Any]] = conversation_history or get_user_memory(key)
     append_user_memory(key, "user", user_message)
-
 
     # 1) Greeting (soft)
     if _is_greeting(low):
         return _remember_and_return(
             user_id=user_id,
+            conversation_id=conversation_id,
             sessions=sessions,
             session=session,
             now=now,
@@ -222,12 +230,14 @@ async def chat_with_user(
 
     # 2) Reset (hard)
     if RESET_RE.search(low):
-        clear_user_state(str(user_id))
-        clear_user_memory(str(user_id))
-        clear_user_jobs(str(user_id))
-        state = get_user_state(str(user_id))
+        clear_user_state(key)
+        clear_user_memory(key)
+        clear_user_jobs(key)
+        state = get_user_state(key)
+
         return _remember_and_return(
             user_id=user_id,
+            conversation_id=conversation_id,
             sessions=sessions,
             session=session,
             now=now,
@@ -239,6 +249,7 @@ async def chat_with_user(
     if _is_ack(low):
         return _remember_and_return(
             user_id=user_id,
+            conversation_id=conversation_id,
             sessions=sessions,
             session=session,
             now=now,
@@ -260,6 +271,7 @@ async def chat_with_user(
         )
         return _remember_and_return(
             user_id=user_id,
+            conversation_id=conversation_id,
             sessions=sessions,
             session=session,
             now=now,
@@ -269,7 +281,6 @@ async def chat_with_user(
 
     # 4b) Reflective mode: offer “clarity pass”
     if intent.name == "reflective":
-        # If they already have both, don’t derail, just clarify
         already_have_role = bool(_role_logic(state))
         already_have_loc = bool((state.get("location") or "").strip())
 
@@ -277,13 +288,19 @@ async def chat_with_user(
             state["phase"] = "clarity_offer"
             return _remember_and_return(
                 user_id=user_id,
+                conversation_id=conversation_id,
                 sessions=sessions,
                 session=session,
                 now=now,
                 text="Got you. Want a quick clarity pass first, or should I continue the search you started?",
                 actions=[
-                    {"type": "YES_NO", "yesLabel": "Clarity pass", "yesValue": "clarity_yes",
-                     "noLabel": "Continue search", "noValue": "clarity_no"}
+                    {
+                        "type": "YES_NO",
+                        "yesLabel": "Clarity pass",
+                        "yesValue": "clarity_yes",
+                        "noLabel": "Continue search",
+                        "noValue": "clarity_no",
+                    }
                 ],
                 debug={"intent": "reflective_with_context"},
             )
@@ -291,6 +308,7 @@ async def chat_with_user(
         state["phase"] = "clarity_offer"
         return _remember_and_return(
             user_id=user_id,
+            conversation_id=conversation_id,
             sessions=sessions,
             session=session,
             now=now,
@@ -310,6 +328,7 @@ async def chat_with_user(
             state["phase"] = "clarity_level"
             return _remember_and_return(
                 user_id=user_id,
+                conversation_id=conversation_id,
                 sessions=sessions,
                 session=session,
                 now=now,
@@ -324,6 +343,7 @@ async def chat_with_user(
             state["phase"] = "discovery"
             return _remember_and_return(
                 user_id=user_id,
+                conversation_id=conversation_id,
                 sessions=sessions,
                 session=session,
                 now=now,
@@ -333,6 +353,7 @@ async def chat_with_user(
 
         return _remember_and_return(
             user_id=user_id,
+            conversation_id=conversation_id,
             sessions=sessions,
             session=session,
             now=now,
@@ -340,7 +361,6 @@ async def chat_with_user(
             actions=[{"type": "YES_NO", "yesValue": "clarity_yes", "noValue": "clarity_no"}],
             debug={"intent": "clarity_offer_repeat"},
         )
-    
 
     if phase == "clarity_level":
         if "student" in low or low.strip() == "1":
@@ -356,6 +376,7 @@ async def chat_with_user(
         else:
             return _remember_and_return(
                 user_id=user_id,
+                conversation_id=conversation_id,
                 sessions=sessions,
                 session=session,
                 now=now,
@@ -366,6 +387,7 @@ async def chat_with_user(
         state["phase"] = "discovery"
         return _remember_and_return(
             user_id=user_id,
+            conversation_id=conversation_id,
             sessions=sessions,
             session=session,
             now=now,
@@ -421,24 +443,37 @@ async def chat_with_user(
         if low in {"yes", "yeah", "yep", "talk_yes"}:
             state["phase"] = "discuss_likes"
             return _remember_and_return(
-                user_id=user_id, sessions=sessions, session=session, now=now,
-                text="Cool. What matters most to you: pay, flexibility, location, or growth?"
+                user_id=user_id,
+                conversation_id=conversation_id,
+                sessions=sessions,
+                session=session,
+                now=now,
+                text="Cool. What matters most to you: pay, flexibility, location, or growth?",
             )
 
         if low in {"no", "n", "nah", "nope", "talk_no"}:
             links = [
                 {"label": f"{c.get('title','Job')} at {c.get('company','')}".strip(), "url": c.get("redirect_url", "")}
-                for c in liked_cards if c.get("redirect_url")
+                for c in liked_cards
+                if c.get("redirect_url")
             ]
             state["phase"] = "ready"
             return _remember_and_return(
-                user_id=user_id, sessions=sessions, session=session, now=now,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                sessions=sessions,
+                session=session,
+                now=now,
                 text="All good. Here are the direct links to the ones you liked:",
-                links=links
+                links=links,
             )
 
         return _remember_and_return(
-            user_id=user_id, sessions=sessions, session=session, now=now,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            sessions=sessions,
+            session=session,
+            now=now,
             text="Quick one: do you want to talk about the jobs you liked? Yes or no.",
             mode="post_swipe",
             actions=[{"type": "YES_NO", "yesValue": "talk_yes", "noValue": "talk_no"}],
@@ -448,7 +483,14 @@ async def chat_with_user(
     if state.get("phase") == "discovery" and not state.get("readiness"):
         q = next_discovery_question(state)
         if q:
-            return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text=q)
+            return _remember_and_return(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                sessions=sessions,
+                session=session,
+                now=now,
+                text=q,
+            )
 
     # 9) Income type clarification (only when we have role + location)
     if state.get("income_type") is None and not state.get("asked_income_type"):
@@ -456,8 +498,12 @@ async def chat_with_user(
             state["asked_income_type"] = True
             role_text = _role_display(state) or "that role"
             return _remember_and_return(
-                user_id=user_id, sessions=sessions, session=session, now=now,
-                text=f"Do you want full-time or part-time {role_text} work in {state['location']}?"
+                user_id=user_id,
+                conversation_id=conversation_id,
+                sessions=sessions,
+                session=session,
+                now=now,
+                text=f"Do you want full-time or part-time {role_text} work in {state['location']}?",
             )
 
     if state.get("asked_income_type"):
@@ -469,8 +515,12 @@ async def chat_with_user(
             state["jobs_shown"] = False
         else:
             return _remember_and_return(
-                user_id=user_id, sessions=sessions, session=session, now=now,
-                text="Full-time or part-time?"
+                user_id=user_id,
+                conversation_id=conversation_id,
+                sessions=sessions,
+                session=session,
+                now=now,
+                text="Full-time or part-time?",
             )
         state["asked_income_type"] = False
 
@@ -487,6 +537,7 @@ async def chat_with_user(
             income_type=income_type,
         )
 
+        # Dedupe by (title,company,location) to avoid near-duplicates
         uniq = {(j.get("title", ""), j.get("company", ""), j.get("location", "")): j for j in (jobs or [])}
         jobs = list(uniq.values())
 
@@ -498,6 +549,7 @@ async def chat_with_user(
             state["phase"] = "no_results"
             return _remember_and_return(
                 user_id=user_id,
+                conversation_id=conversation_id,
                 sessions=sessions,
                 session=session,
                 now=now,
@@ -520,6 +572,8 @@ async def chat_with_user(
         state["phase"] = "results_found"
 
         for job in jobs:
+            # Consider also keying jobs by conversation_id if you want per-chat isolation,
+            # but keeping user_id is fine if "saved jobs" is user-wide.
             save_user_job(str(user_id), job)
 
         deck_id = uuid.uuid4().hex
@@ -534,6 +588,7 @@ async def chat_with_user(
 
         return _remember_and_return(
             user_id=user_id,
+            conversation_id=conversation_id,
             sessions=sessions,
             session=session,
             now=now,
@@ -543,10 +598,22 @@ async def chat_with_user(
             ),
             mode="results_found",
             actions=[{"type": "OPEN_SWIPE", "label": "Swipe jobs", "deckId": deck_id}],
-            debug={"resolved_role": resolved_role, "search_keywords": search_keywords, "totalFound": len(cards), "deckSize": len(deck_cards)},
+            debug={
+                "resolved_role": resolved_role,
+                "search_keywords": search_keywords,
+                "totalFound": len(cards),
+                "deckSize": len(deck_cards),
+            },
         )
 
     # 11) Fallback chat reply (coached, but not pretending we searched)
     reply = await generate_coached_reply(state, memory, user_message)
     reply = reply.strip() or "Tell me the role + location you want, and I’ll find jobs."
-    return _remember_and_return(user_id=user_id, sessions=sessions, session=session, now=now, text=reply)
+    return _remember_and_return(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        sessions=sessions,
+        session=session,
+        now=now,
+        text=reply,
+    )
