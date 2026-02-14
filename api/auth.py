@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, EmailStr, Field
@@ -35,15 +34,19 @@ class SignupRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
 
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=1, max_length=128)
 
+
 class RefreshRequest(BaseModel):
     refreshToken: str = Field(min_length=20, max_length=300)
 
+
 class LogoutRequest(BaseModel):
     refreshToken: str = Field(min_length=20, max_length=300)
+
 
 class AuthResponse(BaseModel):
     userId: int
@@ -73,15 +76,12 @@ async def _issue_refresh_token(session: AsyncSession, user_id: int) -> str:
 # Signup
 # -------------------------------
 @router.post("/signup", response_model=AuthResponse)
-
 async def signup(req: SignupRequest, session: AsyncSession = Depends(get_async_session)):
     email = _norm_email(req.email)
-    print("BACKEND emial repr:", repr(req.email))
-    print("BACKEND email:", req.email)
-    
+
     result = await session.execute(select(User).where(User.email == email))
-    existing_user = result.scalars().first()
-    if existing_user:
+    existing = result.scalars().first()
+    if existing:
         raise HTTPException(status_code=400, detail="User already exists")
 
     user = User(email=email, hashed_password=hash_password(req.password))
@@ -91,12 +91,11 @@ async def signup(req: SignupRequest, session: AsyncSession = Depends(get_async_s
 
     access = create_access_token(str(user.id))
     refresh = await _issue_refresh_token(session, user.id)
-    return {"userId": user.id, "accessToken": access, "refreshToken": refresh}
-   
+    return AuthResponse(userId=user.id, accessToken=access, refreshToken=refresh)
 
 
 # -------------------------------
-# Login (FIXED)
+# Login
 # -------------------------------
 @router.post("/login", response_model=AuthResponse)
 async def login(req: LoginRequest, request: Request, session: AsyncSession = Depends(get_async_session)):
@@ -109,13 +108,13 @@ async def login(req: LoginRequest, request: Request, session: AsyncSession = Dep
     result = await session.execute(select(User).where(User.email == email))
     user = result.scalars().first()
 
-    # Generic failure message (avoid account enumeration)
+    # Generic failure (avoid account enumeration)
     if (not user) or (not verify_password(req.password, user.hashed_password)):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     access = create_access_token(str(user.id))
     refresh = await _issue_refresh_token(session, user.id)
-    return {"userId": user.id, "accessToken": access, "refreshToken": refresh}
+    return AuthResponse(userId=user.id, accessToken=access, refreshToken=refresh)
 
 
 # -------------------------------
@@ -129,24 +128,22 @@ async def refresh(req: RefreshRequest, request: Request, session: AsyncSession =
         raise HTTPException(status_code=429, detail="Too many attempts. Try again shortly.")
 
     token_hash = hash_refresh_token(req.refreshToken)
-
     result = await session.execute(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
     rt = result.scalars().first()
 
-    # Use aware UTC to match refresh_expires_at() in auth_utils.py
     now = datetime.now(timezone.utc)
 
     if (not rt) or (rt.revoked_at is not None) or (rt.expires_at <= now):
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
-    # Rotate: revoke old token, issue a new one
+    # rotate
     rt.revoked_at = now
     rt.last_used_at = now
     await session.commit()
 
     new_refresh = await _issue_refresh_token(session, rt.user_id)
     new_access = create_access_token(str(rt.user_id))
-    return {"userId": rt.user_id, "accessToken": new_access, "refreshToken": new_refresh}
+    return AuthResponse(userId=rt.user_id, accessToken=new_access, refreshToken=new_refresh)
 
 
 # -------------------------------
@@ -164,4 +161,3 @@ async def logout(req: LogoutRequest, session: AsyncSession = Depends(get_async_s
         await session.commit()
 
     return {"ok": True}
-

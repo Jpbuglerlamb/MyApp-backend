@@ -64,7 +64,7 @@ async def get_deck(
     req: DeckRequest,
     user_id: str = Depends(get_current_user_id),
 ) -> APIResponse:
-    state: Dict[str, Any] = get_user_state(str(user_id))
+    state: Dict[str, Any] = get_user_state(str(conversation_id))
     deck = state.get("current_deck") or {}
     deck_id = deck.get("deck_id")
 
@@ -89,7 +89,7 @@ async def submit_swipes(
     req: SwipeSubmitRequest,
     user_id: str = Depends(get_current_user_id),
 ) -> APIResponse:
-    state: Dict[str, Any] = get_user_state(str(user_id))
+    state: Dict[str, Any] = get_user_state(str(conversation_id))
     deck = state.get("current_deck") or {}
     deck_id = deck.get("deck_id")
 

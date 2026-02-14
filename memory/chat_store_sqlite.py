@@ -1,4 +1,6 @@
-import os, sqlite3
+# memory/chat_store_sqlite.py
+import os
+import sqlite3
 from datetime import datetime
 from typing import List, Dict
 
@@ -20,7 +22,8 @@ def init_chat_db():
           created_at TEXT NOT NULL
         )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_conv ON chat_messages(conversation_id)")
+        # ✅ fast lookup by (conversation_id, user_id)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_conv_user ON chat_messages(conversation_id, user_id)")
         conn.commit()
 
 def add_message(conversation_id: str, user_id: str, role: str, content: str):
@@ -32,17 +35,19 @@ def add_message(conversation_id: str, user_id: str, role: str, content: str):
         )
         conn.commit()
 
-def get_messages(conversation_id: str, limit: int = 30) -> List[Dict[str, str]]:
+def get_messages(conversation_id: str, user_id: str, limit: int = 30) -> List[Dict[str, str]]:
     init_chat_db()
     with _connect() as conn:
         rows = conn.execute(
             """
             SELECT role, content FROM chat_messages
-            WHERE conversation_id = ?
+            WHERE conversation_id = ? AND user_id = ?
             ORDER BY created_at DESC
             LIMIT ?
             """,
-            (conversation_id, limit),
+            (conversation_id, user_id, limit),
         ).fetchall()
+
     # return oldest -> newest
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+

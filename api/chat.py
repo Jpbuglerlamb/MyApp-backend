@@ -42,27 +42,21 @@ async def chat(
     req: ChatRequest,
     user_id: str = Depends(get_current_user_id),
 ) -> ChatResponse:
-    # Welcome ping: treat empty message as “give welcome text”
     msg = (req.message or "").strip()
     if msg == "":
-        return ChatResponse(
-            assistantText=WELCOME_TEXT,
-            actions=[],
-            links=[],
-        )
+        return ChatResponse(assistantText=WELCOME_TEXT, actions=[], links=[])
 
     try:
-        # Expect your orchestrator to return a dict-like payload
         result: Dict[str, Any] = await chat_with_user(
-            user_id=user_id, 
+            user_id=str(user_id),
             conversation_id=req.conversation_id,
-            user_message=msg)
-        
+            user_message=msg,
+        )
+
         assistant_text = (result.get("assistantText") or result.get("assistant_text") or "").strip()
         actions = result.get("actions") or []
         links = result.get("links") or []
 
-        # Hard guarantees: never None
         if not isinstance(actions, list):
             actions = []
         if not isinstance(links, list):
@@ -76,7 +70,6 @@ async def chat(
 
     except HTTPException:
         raise
-
     except Exception as e:
-        # Keep server response JSON-shaped and predictable for iOS
         raise HTTPException(status_code=500, detail=f"Chat error: {type(e).__name__}")
+
